@@ -1,28 +1,15 @@
 import asyncio
 import importlib.machinery
-import sys
 import unittest
 from types import SimpleNamespace
-from types import ModuleType
 from unittest.mock import AsyncMock, patch
 
+from app.testing.bootstrap import ensure_optional_stub
 
-def _stub_module(name: str, **attrs):
-    module = sys.modules.get(name)
-    if module is None:
-        module = ModuleType(name)
-        sys.modules[name] = module
-    for key, value in attrs.items():
-        setattr(module, key, value)
-    return module
-
-
-_stub_module("qbittorrentapi", TorrentFilesList=list)
-_stub_module("transmission_rpc", File=object)
-_stub_module(
-    "psutil",
-    __spec__=importlib.machinery.ModuleSpec("psutil", loader=None),
-)
+# 可选三方依赖在 CI / 全新环境可能未安装，补占位（带用例所需属性）避免导入失败
+ensure_optional_stub("qbittorrentapi", TorrentFilesList=list)
+ensure_optional_stub("transmission_rpc", File=object)
+ensure_optional_stub("psutil", __spec__=importlib.machinery.ModuleSpec("psutil", loader=None))
 
 from app.agent.tools.factory import MoviePilotToolFactory
 from app.agent import ReplyMode
@@ -135,7 +122,6 @@ class SearchChainAIRecommendTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("[0, 2]", result)
         self.assertEqual(ReplyMode.CAPTURE_ONLY, captured["reply_mode"])
-        self.assertFalse(captured["persist_output_message"])
         self.assertFalse(captured["allow_message_tools"])
 
     def test_search_by_title_clears_previous_recommend_state_when_caching(self):
@@ -452,12 +438,22 @@ class SearchChainAIRecommendTest(unittest.IsolatedAsyncioTestCase):
                     "title": "",
                     "year": "",
                     "season": "2",
+                    "episode": "",
                     "sites": "1,3",
+                    "result_type": "torrent",
                 },
             ),
             cached,
         )
         self.assertTrue(any(filename == "__search_result__" for filename, _ in cached))
+
+    def test_search_params_preserve_special_season_zero(self):
+        """最近搜索参数必须把显式季 0 保存为字符串 0，供页面刷新后重放。"""
+        params = SearchChain._normalize_search_params(
+            {"keyword": "tmdb:123", "season": 0}
+        )
+
+        self.assertEqual(params["season"], "0")
 
     def test_tool_factory_excludes_message_tools_when_disabled(self):
         with patch(
@@ -475,7 +471,3 @@ class SearchChainAIRecommendTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ask_user_choice", tool_names)
         self.assertNotIn("send_local_file", tool_names)
         self.assertNotIn("send_voice_message", tool_names)
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -1,9 +1,11 @@
 import json
+import threading
 import uuid
 from typing import Any, Dict, List, Optional
 
-from app.agent.tools.base import format_tool_result_for_agent
+from app.agent.tools.base import ToolExecutionTimeoutError, format_tool_result_for_agent
 from app.agent.tools.factory import MoviePilotToolFactory
+from app.core.plugin import PluginManager
 from app.log import logger
 
 
@@ -40,26 +42,59 @@ class MoviePilotToolsManager:
         self.session_id = session_id
         self.is_admin = is_admin
         self.tools: List[Any] = []
+        self._tools_lock = threading.Lock()
+        self._plugin_agent_tools_revision = -1
         self._load_tools()
 
-    def _load_tools(self):
+    def _load_tools(self) -> None:
         """
         加载所有MoviePilot工具
         """
         try:
-            # 创建工具实例
-            self.tools = MoviePilotToolFactory.create_tools(
-                session_id=self.session_id,
-                user_id=self.user_id,
-                channel=None,
-                source="api",
-                username="API Client",
-                stream_handler=None,
-            )
+            plugin_manager = PluginManager()
+            while True:
+                plugin_tools_revision = (
+                    plugin_manager.get_plugin_agent_tools_revision()
+                )
+                tools = MoviePilotToolFactory.create_tools(
+                    session_id=self.session_id,
+                    user_id=self.user_id,
+                    channel=None,
+                    source="api",
+                    username="API Client",
+                    stream_handler=None,
+                    agent_context={"is_admin": self.is_admin},
+                )
+                if (
+                    plugin_tools_revision
+                    == plugin_manager.get_plugin_agent_tools_revision()
+                ):
+                    break
+            self.tools = tools
+            self._plugin_agent_tools_revision = plugin_tools_revision
             logger.info(f"成功加载 {len(self.tools)} 个工具")
         except Exception as e:
             logger.error(f"加载工具失败: {e}", exc_info=True)
             self.tools = []
+            self._plugin_agent_tools_revision = -1
+
+    def _ensure_tools_current(self) -> None:
+        """
+        在插件工具注册表变化后惰性刷新工具实例。
+        """
+        plugin_manager = PluginManager()
+        if (
+            self._plugin_agent_tools_revision
+            == plugin_manager.get_plugin_agent_tools_revision()
+        ):
+            return
+        with self._tools_lock:
+            if (
+                self._plugin_agent_tools_revision
+                == plugin_manager.get_plugin_agent_tools_revision()
+            ):
+                return
+            self._load_tools()
 
     def list_tools(self) -> List[ToolDefinition]:
         """
@@ -68,6 +103,7 @@ class MoviePilotToolsManager:
         Returns:
             工具定义列表
         """
+        self._ensure_tools_current()
         tools_list = []
         for tool in self.tools:
             if getattr(tool, "_require_admin", False) and not self.is_admin:
@@ -101,6 +137,7 @@ class MoviePilotToolsManager:
         Returns:
             工具实例，如果未找到返回None
         """
+        self._ensure_tools_current()
         for tool in self.tools:
             if tool.name == tool_name:
                 return tool
@@ -259,9 +296,25 @@ class MoviePilotToolsManager:
 
             # 调用工具的run方法。HTTP/MCP 工具调用不会经过 BaseTool._arun，
             # 因此这里也必须复用同一套返回值格式化和兜底截断逻辑。
-            result = await tool_instance.run(**normalized_arguments)
-            return format_tool_result_for_agent(
+            result = await tool_instance.run_with_timeout(**normalized_arguments)
+            
+            # 记录工具执行结果摘要日志
+            str_result = format_tool_result_for_agent(
                 result,
+                tool_name=tool_name,
+                max_chars=getattr(tool_instance, "result_max_chars", None),
+            )
+            if len(str_result) > 500:
+                summary = str_result[:500] + f"...(已截断，总长度: {len(str_result)})"
+            else:
+                summary = str_result
+            logger.info(f"Agent工具 {tool_name} 执行完成，结果摘要: {summary}")
+            
+            return str_result
+        except ToolExecutionTimeoutError as e:
+            logger.warning(str(e))
+            return format_tool_result_for_agent(
+                str(e),
                 tool_name=tool_name,
                 max_chars=getattr(tool_instance, "result_max_chars", None),
             )

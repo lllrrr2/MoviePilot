@@ -128,6 +128,7 @@ moviepilot stop
 moviepilot restart
 moviepilot status
 moviepilot logs
+moviepilot doctor
 moviepilot version
 moviepilot config path
 moviepilot config list
@@ -159,6 +160,8 @@ moviepilot install deps --config-dir /path/to/moviepilot-config
 说明：
 
 - 默认会自动选择本地已安装的 `Python 3.11+` 解释器
+- `moviepilot_rust` 加速扩展通过 `moviepilot-rust` PyPI 依赖安装，主项目本地安装不需要 Rust toolchain
+- 安装完成后可在前端“高级设置 - 实验室”中关闭或重新开启 Rust 加速；如果后端未加载扩展，该开关会保持关闭且不可操作
 
 安装前端 release：
 
@@ -220,7 +223,7 @@ moviepilot setup --config-dir /path/to/moviepilot-config
 
 `moviepilot setup` 会串行执行：
 
-1. 安装后端依赖
+1. 安装后端依赖，包括 `moviepilot-rust` 加速扩展
 2. 下载并安装前端 release
 3. 下载并同步资源文件
 4. 初始化本地配置
@@ -235,6 +238,10 @@ moviepilot setup --config-dir /path/to/moviepilot-config
 - 默认下载目录与媒体库目录
 - AI Agent
   可按需启用，并配置 `LLM_PROVIDER`、`LLM_MODEL`、`LLM_API_KEY`、`LLM_BASE_URL`
+  与 `LLM_WEB_SEARCH_MODE`。联网搜索支持 MoviePilot 本地搜索、模型服务端搜索、
+  服务端优先自动回退与完全关闭；服务端模式仅在当前模型目录声明支持时生效。
+  当前可识别 OpenAI、Anthropic Claude、Google Gemini、xAI Grok 与 DeepSeek
+  官方端点已公布的服务端联网搜索能力，第三方兼容端点不会被自动误判。
 - 用户站点认证
   可按需选择认证站点，并按站点要求填写用户名、UID、Passkey 等参数
 - 开机自启
@@ -323,7 +330,7 @@ moviepilot update all --skip-resources
 
 说明：
 
-- `update backend` 会更新 Git 仓库并重新安装后端依赖
+- `update backend` 会更新 Git 仓库并重新安装后端依赖，包括 `moviepilot-rust` 加速扩展
 - `update frontend` 会按当前仓库 `version.py` 中的 `FRONTEND_VERSION` 下载并替换前端 release
 - `update all` 会先更新后端，再按更新后代码中的 `FRONTEND_VERSION` 更新前端，默认也会同步资源文件
 - 更新前请先执行 `moviepilot stop`
@@ -354,6 +361,7 @@ moviepilot agent --new-session 帮我总结当前系统配置有什么明显问�
 ```shell
 moviepilot start
 moviepilot start --timeout 60
+moviepilot start --safe
 moviepilot stop
 moviepilot stop --timeout 30 --force
 moviepilot restart
@@ -365,12 +373,33 @@ moviepilot version
 说明：
 
 - `start` 会先启动后端，再启动前端
+- `start --safe` 会以安全模式启动后端，本次启动跳过插件、调度器、监控、命令和工作流等后台扩展能力，不修改用户配置
 - 如果开启了 `MOVIEPILOT_AUTO_UPDATE=release|true|dev`，`start/restart` 会在启动前尽力执行一次本地自动更新；更新失败只告警，不阻断当前启动
 - 通过系统内置的重启入口触发重启时，本地 CLI 安装模式也会复用同一套前后端进程管理完成重启
 - 前端默认监听 `NGINX_PORT`，默认值 `3000`
 - 后端默认监听 `PORT`，默认值 `3001`
+- `TRANSFER_TASK_TIMEOUT` 控制外部异步接管的运行中整理任务失活超时，单位为分钟，默认 `120`，设为 `0` 可禁用；主程序整理线程仍在直接执行的任务不受此项清理
 - 前端通过 `service.js` 代理 `/api` 与 `/cookiecloud` 到后端
 - 本地前端代理在启动时会先确认后端可用；如果后端长时间不可用，前端也会自动退出，避免只剩半套服务
+
+离线诊断：
+
+```shell
+moviepilot doctor
+moviepilot doctor --json
+moviepilot doctor --fix
+moviepilot doctor --deep
+```
+
+说明：
+
+- `doctor` 不依赖后端服务已经启动，会直接读取配置目录、运行时文件、日志、进程、端口、依赖、数据库和前端资源
+- `--json` 输出稳定 JSON，可供 Agent、脚本或 Issue 流程收集
+- `--fix` 只执行白名单安全修复，例如清理过期 runtime 文件或补齐不合法的 `API_TOKEN`
+- `--deep` 执行可能较慢的深度探测，例如 PostgreSQL TCP 连通性检查
+- Doctor 只分析最近 24 小时日志，并跨主日志、控制台镜像和插件独立日志聚合相同错误
+- 插件日志异常会保留为诊断告警并标记 `affects_report_status=false`，但不会单独降低系统整体状态；`summary.advisory` 单独统计这类建议项，核心错误仍正常参与状态聚合
+- Docker 环境可使用 `docker exec <container> moviepilot doctor`；如果容器已退出，也可用镜像挂载同一配置目录运行 `python -m app.cli doctor`
 
 日志：
 
@@ -458,6 +487,11 @@ moviepilot tool run search_torrents media_type=movie tmdb_id=12345
 - `tool list` 用于动态发现当前服务可调用的工具
 - `tool show` 会输出参数名、类型和描述
 - `tool run` 参数格式固定为 `key=value`
+- `read_file`、`write_file`、`edit_file` 和 `execute_command`
+  属于内置 Agent 的本地敏感能力，不通过 MCP/`moviepilot tool` 暴露；插件开发时
+  由 Agent 按当前用户权限直接调用这些工具。
+- `read_file` 单次最多返回 50KB 文件内容；超出时会截断并提示 Agent 使用
+  `start_line`、`end_line` 指定更小的行号范围继续读取。
 
 ## Scheduler 命令
 

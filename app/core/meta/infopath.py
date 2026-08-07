@@ -8,6 +8,8 @@ AUXILIARY_CN_STEM_FULLMATCH_RE = re.compile(
     r"国英|台粤|音轨|评论|国配|台配|粤语|韩语|日语|杜比|全景声|无损|中字|"
     r"国语|原声)+$"
 )
+PARENT_LATIN_TITLE_RE = re.compile(r"[A-Za-z]{2,}")
+SEASON_EPISODE_CN_RE = re.compile(r"[第共]\s*[0-9一二三四五六七八九十百零]+\s*[季集话話]")
 
 
 def should_use_parent_title_for_file_stem(
@@ -21,9 +23,12 @@ def should_use_parent_title_for_file_stem(
     """
     if not file_meta.isfile or not stem or not parent_dir_name:
         return False
-    if file_meta.tmdbid or file_meta.doubanid:
+    if any((
+            file_meta.tmdbid, file_meta.doubanid,
+            file_meta.bangumiid, file_meta.anilistid, file_meta.media_id,
+    )):
         return False
-    if not re.search(r"[A-Za-z]{2,}", parent_dir_name):
+    if not PARENT_LATIN_TITLE_RE.search(parent_dir_name):
         return False
     if not StringUtils.is_all_chinese(stem):
         return False
@@ -31,7 +36,7 @@ def should_use_parent_title_for_file_stem(
         return False
     if not AUXILIARY_CN_STEM_FULLMATCH_RE.match(stem):
         return False
-    if re.search(r"[第共]\s*[0-9一二三四五六七八九十百零]+\s*[季集话話]", stem):
+    if SEASON_EPISODE_CN_RE.search(stem):
         return False
     return True
 

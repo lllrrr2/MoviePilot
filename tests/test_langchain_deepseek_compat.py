@@ -1,25 +1,8 @@
-import importlib.util
-import sys
 import unittest
-from pathlib import Path
-from types import ModuleType
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-
-def _stub_module(name: str, **attrs):
-    module = sys.modules.get(name)
-    if module is None:
-        module = ModuleType(name)
-        sys.modules[name] = module
-    for key, value in attrs.items():
-        setattr(module, key, value)
-    return module
-
-
-class _DummyLogger:
-    def __getattr__(self, _name):
-        return lambda *args, **kwargs: None
+from app.agent.llm import helper as llm_module
 
 
 def _build_tool_call(name: str = "search", arguments: str = "{}"):
@@ -65,35 +48,20 @@ class _FakeChatDeepSeek:
 _ORIGINAL_GET_REQUEST_PAYLOAD = _FakeChatDeepSeek._get_request_payload
 
 
-sys.modules.pop("app.agent.llm.helper", None)
-_stub_module(
-    "app.core.config",
-    settings=ModuleType("settings"),
-)
-sys.modules["app.core.config"].settings.LLM_PROVIDER = "deepseek"
-sys.modules["app.core.config"].settings.LLM_MODEL = "deepseek-v4-pro"
-sys.modules["app.core.config"].settings.LLM_API_KEY = "sk-test"
-sys.modules["app.core.config"].settings.LLM_BASE_URL = "https://api.deepseek.com"
-sys.modules["app.core.config"].settings.LLM_THINKING_LEVEL = None
-sys.modules["app.core.config"].settings.LLM_TEMPERATURE = 0.1
-sys.modules["app.core.config"].settings.LLM_MAX_CONTEXT_TOKENS = 64
-sys.modules["app.core.config"].settings.PROXY_HOST = None
-_stub_module("app.log", logger=_DummyLogger())
-_stub_module("langchain_deepseek", ChatDeepSeek=_FakeChatDeepSeek)
-
-module_path = Path(__file__).resolve().parents[1] / "app" / "agent" / "llm" / "helper.py"
-spec = importlib.util.spec_from_file_location("test_llm_module_for_deepseek_compat", module_path)
-llm_module = importlib.util.module_from_spec(spec)
-assert spec and spec.loader
-spec.loader.exec_module(llm_module)
-
-
 class DeepSeekCompatPatchTest(unittest.TestCase):
     def setUp(self):
         _FakeChatDeepSeek._get_request_payload = _ORIGINAL_GET_REQUEST_PAYLOAD
         if hasattr(_FakeChatDeepSeek, "_moviepilot_reasoning_content_patched"):
             delattr(_FakeChatDeepSeek, "_moviepilot_reasoning_content_patched")
-        llm_module._patch_deepseek_reasoning_content_support()
+        llm_module._patch_interleaved_reasoning_request_support(
+            _FakeChatDeepSeek,
+            patch_marker="_moviepilot_reasoning_content_patched",
+            thinking_filter=lambda model_name, extra_body: (
+                llm_module._is_deepseek_thinking_enabled(model_name, extra_body)
+            ),
+            normalize_deepseek_messages=True,
+            inject_missing_as_empty=True,
+        )
 
     def test_injects_reasoning_content_for_assistant_tool_calls(self):
         llm = _FakeChatDeepSeek("deepseek-v4-pro")

@@ -92,6 +92,17 @@ class TemplateContextBuilder:
         if not mediainfo:
             return
         season_fmt = f"S{mediainfo.season:02d}" if mediainfo.season is not None else None
+        source_ids = {
+            "themoviedb": mediainfo.tmdb_id,
+            "douban": mediainfo.douban_id,
+            "bangumi": mediainfo.bangumi_id,
+            "anilist": mediainfo.anilist_id,
+        }
+        media_source = mediainfo.source or next(
+            (source for source, media_id in source_ids.items() if media_id is not None),
+            None,
+        )
+        media_id = mediainfo.media_id or source_ids.get(media_source)
         base_info = {
             # 标题
             "title": cls.__convert_invalid_characters(mediainfo.title),
@@ -135,6 +146,14 @@ class TemplateContextBuilder:
             "imdbid": mediainfo.imdb_id,
             # 豆瓣ID
             "doubanid": mediainfo.douban_id,
+            # Bangumi ID
+            "bangumiid": mediainfo.bangumi_id,
+            # AniList ID
+            "anilistid": mediainfo.anilist_id,
+            # 当前媒体数据源
+            "media_source": media_source,
+            # 当前数据源原生ID
+            "media_id": str(media_id) if media_id is not None else None,
         }
         context.update({**base_info, **media_info})
 
@@ -180,6 +199,8 @@ class TemplateContextBuilder:
             "season_fmt": meta.season,
             # 集号
             "episode": meta.episode_seqs,
+            # 当前季总集数
+            "total_episodes": len(episodes) if episodes else 0,
             # 季集 SxxExx
             "season_episode": "%s%s" % (meta.season, meta.episode),
             # 段/节
@@ -603,6 +624,7 @@ class MessageQueueManager(metaclass=SingletonClass):
         self.check_interval = check_interval
 
         self._running = True
+        self._stop_event = threading.Event()
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.thread.start()
 
@@ -705,9 +727,7 @@ class MessageQueueManager(metaclass=SingletonClass):
 
         历史实现把 ``immediately`` 标志直接 pop 后丢弃，所有异步消息一律
         进队列；如果调用时落在用户配置的"免打扰时段"之外，消息会一直挂
-        着不发——Issue #5807 后续实战中观察到 prepare_feedback_issue
-        发出的「确认提交问题反馈」按钮卡片就被这样吞掉，用户在 TG 里
-        永远等不到确认按钮。这里与同步 ``send_message`` 行为对齐：
+        着不发。这里与同步 ``send_message`` 行为对齐：
         指定 ``immediately=True`` 必须当场发出，与时段无关。
         """
         immediately = kwargs.pop("immediately", False)
@@ -752,13 +772,15 @@ class MessageQueueManager(metaclass=SingletonClass):
                         logger.info(f"队列剩余消息：{self.queue.qsize()}")
                     except queue.Empty:
                         break
-            time.sleep(self.check_interval)
+            if self._stop_event.wait(self.check_interval):
+                break
 
     def stop(self) -> None:
         """
         停止队列管理器
         """
         self._running = False
+        self._stop_event.set()
         logger.info("正在停止消息队列...")
         self.thread.join()
         logger.info("消息队列已停止")
@@ -766,61 +788,74 @@ class MessageQueueManager(metaclass=SingletonClass):
 
 class MessageHelper(metaclass=Singleton):
     """
-    消息队列管理器，包括系统消息和用户消息
+    消息队列管理器，负责系统和插件实时消息的 SSE 推送
     """
 
     def __init__(self):
         self.sys_queue = queue.Queue()
-        self.user_queue = queue.Queue()
+        self._recent_notification_keys = TTLCache(region="message:notification", maxsize=500, ttl=60)
+
+    @staticmethod
+    def _build_system_notification_key(
+            message: Any, role: str, title: str = None, note: Union[list, dict] = None
+    ) -> str:
+        """
+        构建系统通知短期去重键。
+        """
+        return json.dumps(
+            {
+                "role": role,
+                "title": title or "",
+                "text": str(message),
+                "note": note or {},
+                "time": time.strftime("%Y-%m-%d %H:%M", time.localtime()),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _is_recent_system_notification(
+            self, message: Any, role: str, title: str = None, note: Union[list, dict] = None
+    ) -> bool:
+        """
+        判断系统通知是否在短时间内重复。
+        """
+        key = self._build_system_notification_key(message, role, title=title, note=note)
+        if self._recent_notification_keys.get(key):
+            return True
+        self._recent_notification_keys.set(key, True)
+        return False
 
     def put(self, message: Any, role: str = "plugin", title: str = None, note: Union[list, dict] = None):
         """
         存消息
         :param message: 消息
-        :param role: 消息通道 systm：系统消息，plugin：插件消息，user：用户消息
+        :param role: 消息通道 system：系统消息，plugin：插件消息
         :param title: 标题
         :param note: 附件json
         """
-        if role in ["system", "plugin"]:
-            # 没有标题时获取插件名称
-            if role == "plugin" and not title:
-                title = "插件通知"
-            # 系统通知，默认
-            self.sys_queue.put(json.dumps({
-                "type": role,
-                "title": title,
-                "text": message,
-                "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                "note": note
-            }))
-        else:
-            if isinstance(message, str):
-                # 非系统的文本通知
-                self.user_queue.put(json.dumps({
-                    "title": title,
-                    "text": message,
-                    "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                    "note": note
-                }))
-            elif hasattr(message, "to_dict"):
-                # 非系统的复杂结构通知，如媒体信息/种子列表等。
-                content = message.to_dict()
-                content['title'] = title
-                content['date'] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                content['note'] = note
-                self.user_queue.put(json.dumps(content))
+        if role not in ["system", "plugin"]:
+            return
+        # 没有标题时获取插件名称
+        if role == "plugin" and not title:
+            title = "插件通知"
+        if self._is_recent_system_notification(message, role, title=title, note=note):
+            return
+        self.sys_queue.put(json.dumps({
+            "type": role,
+            "title": title,
+            "text": message,
+            "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "note": note
+        }))
 
     def get(self, role: str = "system") -> Optional[str]:
         """
         取消息
-        :param role: 消息通道 systm：系统消息，plugin：插件消息，user：用户消息
+        :param role: 兼容旧参数，当前所有 SSE 消息共用一个队列
         """
-        if role == "system":
-            if not self.sys_queue.empty():
-                return self.sys_queue.get(block=False)
-        else:
-            if not self.user_queue.empty():
-                return self.user_queue.get(block=False)
+        if not self.sys_queue.empty():
+            return self.sys_queue.get(block=False)
         return None
 
 
@@ -828,7 +863,8 @@ def stop_message():
     """
     停止消息服务
     """
-    # 停止消息队列
-    MessageQueueManager().stop()
-    # 关闭消息演染器
-    TemplateHelper().close()
+    # 只关闭已启动的服务，避免清理路径反向创建后台线程和缓存
+    if queue_manager := MessageQueueManager.get_existing_instance():
+        queue_manager.stop()
+    if template_helper := TemplateHelper.get_existing_instance():
+        template_helper.close()

@@ -7,6 +7,15 @@ from app.schemas.types import MessageChannel
 
 
 class TestAgentAddSubscribeTool(unittest.TestCase):
+    def test_tool_message_displays_special_season_zero(self):
+        """Agent 提示必须把显式季 0 显示为特别季，而不是默认第一季。"""
+        tool = AddSubscribeTool(session_id="session-1", user_id="10001")
+
+        message = tool.get_tool_message(title="测试剧", media_type="tv", season=0)
+
+        self.assertIn("第0季", message)
+        self.assertNotIn("第1季(默认)", message)
+
     def test_tv_subscription_without_season_reports_default_first_season(self):
         tool = AddSubscribeTool(session_id="session-1", user_id="10001")
         tool.set_message_attr(
@@ -85,7 +94,3 @@ class TestAgentAddSubscribeTool(unittest.TestCase):
 
         self.assertEqual(async_add.await_args.kwargs["username"], "moviepilot-user")
         self.assertIn("成功添加订阅：The Matrix (1999)", result)
-
-
-if __name__ == "__main__":
-    unittest.main()

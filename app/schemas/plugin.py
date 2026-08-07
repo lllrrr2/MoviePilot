@@ -42,6 +42,8 @@ class Plugin(BaseModel):
     system_version_message: Optional[str] = None
     # 主系统版本限定范围
     system_version: Optional[str] = None
+    # 是否声明支持通过 GitHub Release 资产安装
+    release: Optional[bool] = False
     # 是否本地
     is_local: Optional[bool] = False
     # 仓库地址
@@ -91,6 +93,26 @@ class PluginSidebarNavItem(BaseModel):
         description="权限：subscribe / discovery / search / manage / admin",
     )
     order: int = Field(default=0, description="同组内排序，越小越靠前")
+
+
+class PluginRatingRequest(BaseModel):
+    """插件评分请求"""
+
+    rating: float = Field(
+        ge=0.1,
+        le=5.0,
+        multiple_of=0.1,
+        description="评分，范围 0.1 至 5.0，精确到 0.1",
+    )
+
+
+class PluginRating(BaseModel):
+    """插件评分结果"""
+
+    plugin_id: str = Field(description="插件 ID")
+    average_rating: float = Field(default=0.0, description="平均评分")
+    rating_count: int = Field(default=0, description="评分人数")
+    user_rating: Optional[float] = Field(default=None, description="当前安装实例评分")
 
 
 class PluginMemoryInfo(BaseModel):

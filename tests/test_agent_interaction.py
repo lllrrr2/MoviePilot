@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.agent.prompt import prompt_manager
 from app.agent.tools.factory import MoviePilotToolFactory
@@ -8,25 +8,38 @@ from app.agent.tools.impl.ask_user_choice import (
     AskUserChoiceTool,
     UserChoiceOptionInput,
 )
-from app.agent.tools.impl.feedback_issue_state import (
-    FEEDBACK_CONFIRM_VALUE_PREFIX,
-    build_feedback_draft_hash,
-    feedback_issue_state_store,
-)
+from app.agent.tools.impl.send_message import SendMessageTool
 from app.helper.interaction import (
     AgentInteractionOption,
     agent_interaction_manager,
 )
 from app.chain.message import MessageChain
+from app.core.config import settings
 from app.schemas.types import MessageChannel
 
 
 class TestAgentInteraction(unittest.TestCase):
     def tearDown(self):
         agent_interaction_manager.clear()
-        feedback_issue_state_store.clear()
 
     def test_prompt_injects_choice_tool_hint_only_for_button_channels(self):
+        telegram_prompt = prompt_manager.get_agent_prompt(
+            channel=MessageChannel.Telegram.value
+        )
+        web_agent_prompt = prompt_manager.get_agent_prompt(
+            channel=MessageChannel.WebAgent.value
+        )
+        wechat_prompt = prompt_manager.get_agent_prompt(
+            channel=MessageChannel.Wechat.value
+        )
+
+        self.assertIn("ask_user_choice", telegram_prompt)
+        self.assertIn("ask_user_choice", web_agent_prompt)
+        self.assertIn("terminal interaction tool", telegram_prompt)
+        self.assertIn("do not write a final text reply after it", telegram_prompt)
+        self.assertNotIn("ask_user_choice", wechat_prompt)
+
+    def test_prompt_does_not_inject_send_message_html_hint(self):
         telegram_prompt = prompt_manager.get_agent_prompt(
             channel=MessageChannel.Telegram.value
         )
@@ -34,8 +47,9 @@ class TestAgentInteraction(unittest.TestCase):
             channel=MessageChannel.Wechat.value
         )
 
-        self.assertIn("ask_user_choice", telegram_prompt)
-        self.assertNotIn("ask_user_choice", wechat_prompt)
+        self.assertNotIn("parse_mode=\"HTML\"", telegram_prompt)
+        self.assertNotIn("Telegram-supported HTML tags", telegram_prompt)
+        self.assertNotIn("parse_mode=\"HTML\"", wechat_prompt)
 
     def test_factory_injects_choice_tool_only_for_button_channels(self):
         with patch(
@@ -49,6 +63,13 @@ class TestAgentInteraction(unittest.TestCase):
                 source="telegram-test",
                 username="tester",
             )
+            web_agent_tools = MoviePilotToolFactory.create_tools(
+                session_id="session-web",
+                user_id="10001",
+                channel=MessageChannel.WebAgent.value,
+                source="web-agent",
+                username="tester",
+            )
             wechat_tools = MoviePilotToolFactory.create_tools(
                 session_id="session-2",
                 user_id="10001",
@@ -58,7 +79,22 @@ class TestAgentInteraction(unittest.TestCase):
             )
 
         self.assertIn("ask_user_choice", [tool.name for tool in telegram_tools])
+        self.assertIn("ask_user_choice", [tool.name for tool in web_agent_tools])
         self.assertNotIn("ask_user_choice", [tool.name for tool in wechat_tools])
+
+    def test_choice_tool_returns_direct_after_sending_interaction(self):
+        """发送按钮后应结束当前 Agent 轮次，等待用户选择作为新消息进入。"""
+        tool = AskUserChoiceTool(session_id="session-1", user_id="10001")
+
+        self.assertTrue(tool.return_direct)
+        self.assertIn("terminal interaction tool", tool.description)
+
+    def test_send_message_tool_returns_direct_after_sending_message(self):
+        """发送消息工具发出用户可见消息后应结束当前 Agent 轮次。"""
+        tool = SendMessageTool(session_id="session-1", user_id="10001")
+
+        self.assertTrue(tool.return_direct)
+        self.assertIn("terminal response tool", tool.description)
 
     def test_choice_tool_sends_buttons_and_registers_pending_request(self):
         tool = AskUserChoiceTool(session_id="session-1", user_id="10001")
@@ -70,7 +106,7 @@ class TestAgentInteraction(unittest.TestCase):
         tool.set_agent_context(agent_context={})
 
         with patch(
-            "app.agent.tools.impl.ask_user_choice.ToolChain.async_post_message",
+            "app.agent.tools.base.ToolChain.async_post_message",
             new=AsyncMock(),
         ) as async_post_message:
             result = asyncio.run(
@@ -89,6 +125,7 @@ class TestAgentInteraction(unittest.TestCase):
         notification = async_post_message.await_args.args[0]
         self.assertEqual(notification.text, "请选择要执行的操作")
         self.assertEqual(sum(len(row) for row in notification.buttons), 2)
+        self.assertNotIn("description", notification.buttons[0][0])
 
         callback_data = notification.buttons[0][0]["callback_data"]
         _, _, request_id, option_index = callback_data.split(":")
@@ -111,7 +148,7 @@ class TestAgentInteraction(unittest.TestCase):
         )
 
         with patch(
-            "app.agent.tools.impl.ask_user_choice.ToolChain.async_post_message",
+            "app.agent.tools.base.ToolChain.async_post_message",
             new=AsyncMock(),
         ) as async_post_message:
             result = asyncio.run(
@@ -133,39 +170,6 @@ class TestAgentInteraction(unittest.TestCase):
         self.assertIn("质量门槛拒绝", result)
         async_post_message.assert_not_awaited()
 
-    def test_choice_tool_blocks_after_feedback_preview_pending(self):
-        """#5807 回归：prepare_feedback_issue 发完按钮后，agent 不应再叠 ask_user_choice。
-
-        否则用户会收到两个确认按钮、点两次、agent 跑两轮 → 同一条成功
-        文案在 TG 里重复 3 次。"""
-        tool = AskUserChoiceTool(session_id="session-feedback", user_id="10001")
-        tool.set_message_attr(
-            channel=MessageChannel.Telegram.value,
-            source="telegram-test",
-            username="tester",
-        )
-        tool.set_agent_context(
-            agent_context={"reply_mode": "feedback_issue_confirmation"}
-        )
-
-        with patch(
-            "app.agent.tools.impl.ask_user_choice.ToolChain.async_post_message",
-            new=AsyncMock(),
-        ) as async_post_message:
-            result = asyncio.run(
-                tool.run(
-                    message="已准备 ISSUE，请确认是否提交到上游仓库？",
-                    options=[
-                        UserChoiceOptionInput(label="确认提交", value="确认提交"),
-                        UserChoiceOptionInput(label="取消", value="取消"),
-                    ],
-                )
-            )
-
-        # 工具应该自我拒绝，不再发第二个按钮卡片
-        self.assertIn("prepare_feedback_issue", result)
-        async_post_message.assert_not_awaited()
-
     def test_agent_interaction_callback_routes_selected_value_back_to_agent(self):
         chain = MessageChain()
         request = agent_interaction_manager.create_request(
@@ -182,12 +186,20 @@ class TestAgentInteraction(unittest.TestCase):
             ],
         )
 
-        with patch.object(chain, "_handle_ai_message") as handle_ai_message, patch.object(
+        with patch.object(settings, "AI_AGENT_ENABLE", True), patch.object(
             chain.messagehelper, "put"
-        ) as message_put, patch.object(chain.messageoper, "add") as message_add, patch.object(
+        ) as message_put, patch.object(
+            chain.messageoper, "add"
+        ) as message_add, patch.object(
             chain, "edit_message", return_value=True
-        ) as edit_message:
-            chain._handle_callback(
+        ) as edit_message, patch(
+            "app.chain.message.agent_manager.process_message",
+            new_callable=AsyncMock,
+        ) as process_message, patch(
+            "app.chain.message.asyncio.run_coroutine_threadsafe",
+            side_effect=lambda coro, _loop: (coro.close(), Mock())[1],
+        ):
+            handled = chain._handle_callback(
                 text=f"CALLBACK:agent_interaction:choice:{request.request_id}:1",
                 channel=MessageChannel.Telegram,
                 source="telegram-test",
@@ -197,7 +209,7 @@ class TestAgentInteraction(unittest.TestCase):
                 original_chat_id="456",
             )
 
-        handle_ai_message.assert_called_once()
+        self.assertTrue(handled)
         edit_message.assert_called_once_with(
             channel=MessageChannel.Telegram,
             source="telegram-test",
@@ -206,108 +218,15 @@ class TestAgentInteraction(unittest.TestCase):
             title="需要你的选择",
             text="请选择\n\n已选择：电影",
         )
-        kwargs = handle_ai_message.call_args.kwargs
-        self.assertEqual(kwargs["text"], "我选择电影")
+        process_message.assert_called_once()
+        kwargs = process_message.call_args.kwargs
+        self.assertEqual(kwargs["message"], "我选择电影")
         self.assertEqual(kwargs["session_id"], "session-choice")
-        message_put.assert_called_once()
-        message_add.assert_called_once()
-
-    def test_feedback_confirmation_callback_marks_token_confirmed(self):
-        draft_hash = build_feedback_draft_hash(
-            title="[错误报告]: 订阅刷新接口返回 500 错误码",
-            version="v2.12.2",
-            environment="Docker",
-            issue_type="主程序运行问题",
-            description="## 现象\n错误\n## 复现步骤\n点击刷新\n## 期望行为\n正常刷新",
-            original_user_request="订阅刷新接口返回 500",
-            logs="ERROR demo",
-            diagnostics_id="diag-1",
-        )
-        confirmation = feedback_issue_state_store.create_confirmation(
-            session_id="session-feedback",
-            user_id="10001",
-            username="tester",
-            draft_hash=draft_hash,
-            diagnostics_id="diag-1",
-        )
-        request = agent_interaction_manager.create_request(
-            session_id="session-feedback",
-            user_id="10001",
-            channel=MessageChannel.Telegram.value,
-            source="telegram-test",
-            username="tester",
-            title="确认提交问题反馈",
-            prompt="请确认",
-            options=[
-                AgentInteractionOption(
-                    label="确认提交",
-                    value=f"{FEEDBACK_CONFIRM_VALUE_PREFIX}{confirmation.confirmation_token}",
-                )
-            ],
-        )
-        chain = MessageChain()
-
-        with patch.object(chain, "_handle_ai_message") as handle_ai_message, patch.object(
-            chain.messagehelper, "put"
-        ), patch.object(chain.messageoper, "add"), patch.object(
-            chain, "edit_message", return_value=True
-        ):
-            chain._handle_callback(
-                text=f"CALLBACK:agent_interaction:choice:{request.request_id}:1",
-                channel=MessageChannel.Telegram,
-                source="telegram-test",
-                userid="10001",
-                username="tester",
-            )
-
-        kwargs = handle_ai_message.call_args.kwargs
-        self.assertIn("confirmation_token", kwargs["text"])
-        consumed = feedback_issue_state_store.consume_confirmed(
-            confirmation.confirmation_token,
-            session_id="session-feedback",
-            user_id="10001",
-            draft_hash=draft_hash,
-        )
-        self.assertIsNotNone(consumed)
-
-    def test_state_store_active_confirmation_helpers(self):
-        # find_active_confirmation 应只返回 confirmed_at=None 的记录
-        rec1 = feedback_issue_state_store.create_confirmation(
-            session_id="s1", user_id="u1", username=None,
-            draft_hash="h1", diagnostics_id="d1",
-        )
-        rec2 = feedback_issue_state_store.create_confirmation(
-            session_id="s1", user_id="u2", username=None,
-            draft_hash="h2", diagnostics_id="d2",
-        )
-        # 跨用户隔离
-        self.assertEqual(
-            feedback_issue_state_store.find_active_confirmation(
-                session_id="s1", user_id="u1"
-            ).confirmation_token,
-            rec1.confirmation_token,
-        )
-        # 标记为已确认后不应再被 active 检索返回
-        feedback_issue_state_store.mark_confirmed(
-            rec1.confirmation_token, session_id="s1", user_id="u1"
-        )
-        self.assertIsNone(
-            feedback_issue_state_store.find_active_confirmation(
-                session_id="s1", user_id="u1"
-            )
-        )
-        # invalidate_active_confirmations 只清掉当前会话+用户的 pending 记录
-        dropped = feedback_issue_state_store.invalidate_active_confirmations(
-            session_id="s1", user_id="u2"
-        )
-        self.assertEqual(dropped, 1)
-        self.assertIsNone(
-            feedback_issue_state_store.find_active_confirmation(
-                session_id="s1", user_id="u2"
-            )
-        )
-        # 已 confirmed 的 rec1 不应该被这次 invalidate 误删
-        self.assertIn(rec1.confirmation_token, feedback_issue_state_store._confirmations)
+        self.assertEqual(kwargs["channel"], MessageChannel.Telegram.value)
+        self.assertEqual(kwargs["source"], "telegram-test")
+        self.assertNotIn("processing_status", kwargs)
+        message_put.assert_not_called()
+        message_add.assert_not_called()
 
     def test_legacy_agent_choice_callback_still_supported(self):
         chain = MessageChain()
@@ -334,7 +253,3 @@ class TestAgentInteraction(unittest.TestCase):
             )
 
         handle_ai_message.assert_called_once()
-
-
-if __name__ == "__main__":
-    unittest.main()

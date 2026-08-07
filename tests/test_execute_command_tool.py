@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest.mock import patch
 
 from app.agent.tools.impl.execute_command import (
     ExecuteCommandTool,
@@ -35,24 +36,28 @@ class TestExecuteCommandTool(unittest.TestCase):
         return asyncio.run(tool.run(action="run", command=command, timeout=timeout))
 
     def test_large_output_is_truncated_before_returning_to_agent(self):
-        """大输出一次性命令只把预览返回给 Agent，并把完整内容写到临时文件。"""
+        """大输出一次性命令返回头尾预览，并把完整内容写到临时文件。"""
         command = _python_command(
-            "import sys; sys.stdout.write('x' * 200000); sys.stdout.flush()"
+            "import sys; sys.stdout.write('HEAD-' + 'x' * 200000 + '-TAIL'); sys.stdout.flush()"
         )
 
         result = self._run_command(command)
         temp_file_path = self._temp_file_path_from_result(result)
 
         self.addCleanup(lambda: os.path.exists(temp_file_path) and os.unlink(temp_file_path))
-        self.assertIn("命令输出超过 10KB", result)
-        self.assertIn("仅展示前 10KB 内容", result)
+        self.assertIn("命令输出超过 32KB", result)
+        self.assertIn("仅展示前后各 16KB 内容", result)
         self.assertIn("如需完整内容，请继续读取该文件", result)
-        self.assertLess(len(result), MAX_OUTPUT_PREVIEW_BYTES + 600)
+        self.assertIn("HEAD-", result)
+        self.assertIn("-TAIL", result)
+        self.assertLess(len(result), MAX_OUTPUT_PREVIEW_BYTES + 1200)
 
         with open(temp_file_path, encoding="utf-8") as file_handle:
             file_content = file_handle.read()
 
         self.assertIn("[标准输出]", file_content)
+        self.assertIn("HEAD-", file_content)
+        self.assertIn("-TAIL", file_content)
         self.assertGreater(len(file_content), 100000)
 
     def test_timeout_returns_partial_output_promptly(self):
@@ -69,10 +74,43 @@ class TestExecuteCommandTool(unittest.TestCase):
         self.assertIn("命令执行超时", result)
         self.assertIn("started", result)
 
+    def test_cancelled_run_cleans_up_process(self):
+        """外层取消 action=run 时应同步清理已经启动的子进程。"""
+        async def _run_and_cancel():
+            tool = ExecuteCommandTool(session_id="session-1", user_id="10001")
+            command = _python_command("import time; time.sleep(20)")
+            original_create = asyncio.create_subprocess_shell
+            process_holder = {}
+
+            async def wrapped_create(*args, **kwargs):
+                process = await original_create(*args, **kwargs)
+                process_holder["process"] = process
+                return process
+
+            with patch(
+                "app.agent.tools.impl.execute_command.asyncio.create_subprocess_shell",
+                side_effect=wrapped_create,
+            ):
+                task = asyncio.create_task(
+                    tool.run(action="run", command=command, timeout=60)
+                )
+                for _ in range(50):
+                    if "process" in process_holder:
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertIn("process", process_holder)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                return process_holder["process"]
+
+        process = asyncio.run(_run_and_cancel())
+        self.assertIsNotNone(process.returncode)
+
     def test_timeout_with_large_output_writes_partial_full_log_to_temp_file(self):
         """超时且输出较大时，终止前完整输出应写入临时文件。"""
         command = _python_command(
-            "import sys, time; sys.stdout.write('x' * 20000); sys.stdout.flush(); time.sleep(5)"
+            "import sys, time; sys.stdout.write('x' * 60000); sys.stdout.flush(); time.sleep(5)"
         )
 
         result = self._run_command(command, timeout=1)
@@ -86,7 +124,7 @@ class TestExecuteCommandTool(unittest.TestCase):
             file_content = file_handle.read()
 
         self.assertIn("[标准输出]", file_content)
-        self.assertGreaterEqual(file_content.count("x"), 20000)
+        self.assertGreaterEqual(file_content.count("x"), 60000)
 
     def test_timeout_is_capped(self):
         """一次性执行的 timeout 参数超过上限时应自动限幅。"""
@@ -103,7 +141,29 @@ class TestExecuteCommandTool(unittest.TestCase):
 
         payload = json.loads(result)
         self.assertEqual(payload["status"], "error")
-        self.assertIn("禁止使用", payload["error"])
+        # rm -rf / 命中高危命令防护；断言拒绝且提示需要显式确认，避免锁死单一文案。
+        self.assertIn("confirm_dangerous=true", payload["error"])
+
+    def test_dangerous_command_requires_explicit_confirmation(self):
+        """高危命令只有携带显式确认参数时才允许进入执行层。"""
+        tool = ExecuteCommandTool(session_id="session-1", user_id="10001")
+
+        rejected = asyncio.run(
+            tool.run(action="run", command="echo ok && shutdown now", timeout=1)
+        )
+        allowed = asyncio.run(
+            tool.run(
+                action="run",
+                command=_python_command("print('shutdown now confirmed')"),
+                timeout=1,
+                confirm_dangerous=True,
+            )
+        )
+
+        rejected_payload = json.loads(rejected)
+        self.assertEqual("error", rejected_payload["status"])
+        self.assertIn("confirm_dangerous=true", rejected_payload["error"])
+        self.assertIn("shutdown now confirmed", allowed)
 
 
 class TestExecuteCommandSessionTool(unittest.IsolatedAsyncioTestCase):
@@ -224,7 +284,3 @@ class TestExecuteCommandSessionTool(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("started", read_payload["output"])
         self.assertIn(kill_payload["status"], {"killed", "exited"})
-
-
-if __name__ == "__main__":
-    unittest.main()

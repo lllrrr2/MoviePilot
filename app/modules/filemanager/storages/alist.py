@@ -1,3 +1,4 @@
+import hashlib
 import json
 import time
 from datetime import datetime
@@ -14,6 +15,10 @@ from app.schemas.types import StorageSchema
 from app.utils.http import RequestUtils
 from app.utils.singleton import WeakSingleton
 from app.utils.url import UrlUtils
+
+
+# OpenList/AList 在 per_page<=0 时会退回后端默认 200，显式指定最大页大小避免大目录被截断。
+OPENLIST_MAX_LIST_PAGE_SIZE = 500
 
 
 class Alist(StorageBase, metaclass=WeakSingleton):
@@ -201,6 +206,8 @@ class Alist(StorageBase, metaclass=WeakSingleton):
             return []
         items = []
         current_page = page
+        auto_page = per_page <= 0
+        effective_per_page = OPENLIST_MAX_LIST_PAGE_SIZE if auto_page else per_page
         while True:
             resp = RequestUtils(headers=self.__get_header_with_token()).post_res(
                 self.__get_api_url("/api/fs/list"),
@@ -208,7 +215,7 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                     "path": fileitem.path,
                     "password": password,
                     "page": current_page,
-                    "per_page": per_page,
+                    "per_page": effective_per_page,
                     "refresh": refresh,
                 },
             )
@@ -267,7 +274,8 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                 )
                 return []
 
-            page_content = result["data"].get("content") or []
+            page_data = result["data"]
+            page_content = page_data.get("content") or []
             items.extend(
                 [
                     schemas.FileItem(
@@ -286,11 +294,15 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                 ]
             )
 
-            if per_page > 0:
+            if not auto_page:
                 return items
 
-            total = result["data"].get("total") or 0
+            total = page_data.get("filtered_total") or page_data.get("total") or 0
+            pages_total = page_data.get("pages_total") or 0
+            has_more = page_data.get("has_more")
             if not page_content or len(items) >= total:
+                return items
+            if has_more is False or (pages_total and current_page >= pages_total):
                 return items
 
             current_page += 1
@@ -467,57 +479,24 @@ class Alist(StorageBase, metaclass=WeakSingleton):
         """
         return self.get_folder(Path(fileitem.path).parent)
 
-    def __is_empty_dir(self, fileitem: schemas.FileItem) -> bool:
-        """
-        判断目录是否为空
-
-        :param fileitem: 文件项
-        :return: 是否为空目录
-        """
-        if fileitem.type != "dir":
-            return False
-        # 获取目录内容
-        items = self.list(fileitem)
-        return len(items) == 0
-
     def delete(self, fileitem: schemas.FileItem) -> bool:
         """
-        删除文件或目录，空目录用专用API
+        删除文件或目录
 
         :param fileitem: 文件项
         :return: 是否删除成功
         """
-        # 如果是空目录，优先用 remove_empty_directory
-        if fileitem.type == "dir" and self.__is_empty_dir(fileitem):
-            resp = RequestUtils(headers=self.__get_header_with_token()).post_res(
-                self.__get_api_url("/api/fs/remove_empty_directory"),
-                json={
-                    "src_dir": fileitem.path,
-                },
-            )
-            if resp is None:
-                logger.warn(
-                    f"【OpenList】请求删除空目录 {fileitem.path} 失败，无法连接alist服务"
-                )
-                return False
-            if resp.status_code != 200:
-                logger.warn(
-                    f"【OpenList】请求删除空目录 {fileitem.path} 失败，状态码：{resp.status_code}"
-                )
-                return False
-            result = resp.json()
-            if result["code"] != 200:
-                logger.warn(
-                    f"【OpenList】删除空目录 {fileitem.path} 失败，错误信息：{result['message']}"
-                )
-                return False
-            return True
-        # 其它情况（文件或非空目录）
+        path = Path(fileitem.path)
+        name = fileitem.name or path.name
+        if not name:
+            logger.warn(f"【OpenList】删除路径 {fileitem.path} 无效")
+            return False
+
         resp = RequestUtils(headers=self.__get_header_with_token()).post_res(
             self.__get_api_url("/api/fs/remove"),
             json={
-                "dir": Path(fileitem.path).parent.as_posix(),
-                "names": [fileitem.name],
+                "dir": path.parent.as_posix(),
+                "names": [name],
             },
         )
         if resp is None:
@@ -697,6 +676,7 @@ class Alist(StorageBase, metaclass=WeakSingleton):
             # 获取文件大小
             target_name = new_name or path.name
             target_path = Path(fileitem.path) / target_name
+            stat = path.stat()
 
             # 初始化进度回调
             progress_callback = transfer_process(path.as_posix())
@@ -707,6 +687,9 @@ class Alist(StorageBase, metaclass=WeakSingleton):
             headers.setdefault("Content-Type", "application/octet-stream")
             headers.setdefault("As-Task", str(task).lower())
             headers.setdefault("File-Path", encoded_path)
+            headers.setdefault("Content-Length", str(stat.st_size))
+            headers.setdefault("Last-Modified", str(int(stat.st_mtime * 1000)))
+            headers.update(self.__get_upload_hash_headers(path))
 
             # 创建自定义的文件流，支持进度回调
             class ProgressFileReader:
@@ -771,6 +754,28 @@ class Alist(StorageBase, metaclass=WeakSingleton):
         except Exception as e:
             logger.error(f"【OpenList】上传文件 {path} 失败：{e}")
             return None
+
+    @staticmethod
+    def __get_upload_hash_headers(path: Path) -> dict:
+        """
+        计算 OpenList 秒传所需的文件哈希请求头。
+        """
+        md5_hash = hashlib.md5()
+        sha1_hash = hashlib.sha1()
+        sha256_hash = hashlib.sha256()
+        with open(path, "rb") as file_handler:
+            while True:
+                chunk = file_handler.read(1024 * 1024)
+                if not chunk:
+                    break
+                md5_hash.update(chunk)
+                sha1_hash.update(chunk)
+                sha256_hash.update(chunk)
+        return {
+            "X-File-Md5": md5_hash.hexdigest(),
+            "X-File-Sha1": sha1_hash.hexdigest(),
+            "X-File-Sha256": sha256_hash.hexdigest(),
+        }
 
     def detail(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
         """

@@ -7,13 +7,14 @@ import base64
 import copy
 import hashlib
 import json
+import re
 import secrets
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import aiofiles
 import httpx
@@ -105,6 +106,91 @@ class LLMProviderManager(metaclass=Singleton):
     _MODELS_DEV_URL = "https://models.dev/api.json"
     _MODELS_DEV_BUNDLED_PATH = Path(__file__).with_name("models.json")
     _MODELS_DEV_CACHE_TTL = 7 * 24 * 60 * 60
+    _AUTH_SESSION_DONE_RETENTION = 300
+    _BEDROCK_DEFAULT_REGION = "us-east-1"
+    _BEDROCK_API_KEY_PREFIX = "bedrock-api-key-"
+    _BEDROCK_GPT_OSS_BASE_REGIONS = (
+        "ap-northeast-1",
+        "ap-south-1",
+        "ap-southeast-2",
+        "eu-central-1",
+        "eu-north-1",
+        "eu-west-1",
+        "eu-west-2",
+        "sa-east-1",
+        "us-east-1",
+        "us-east-2",
+        "us-west-2",
+    )
+    _BEDROCK_GPT_OSS_SAFEGUARD_REGIONS = (
+        "ap-northeast-1",
+        "ap-south-1",
+        "ap-southeast-2",
+        "eu-west-1",
+        "eu-west-2",
+        "sa-east-1",
+        "us-east-1",
+        "us-east-2",
+        "us-west-2",
+    )
+    _BEDROCK_ON_DEMAND_MODEL_REGIONS = {
+        "openai.gpt-oss-120b-1:0": _BEDROCK_GPT_OSS_BASE_REGIONS,
+        "openai.gpt-oss-20b-1:0": _BEDROCK_GPT_OSS_BASE_REGIONS,
+        "openai.gpt-oss-safeguard-120b": _BEDROCK_GPT_OSS_SAFEGUARD_REGIONS,
+        "openai.gpt-oss-safeguard-20b": _BEDROCK_GPT_OSS_SAFEGUARD_REGIONS,
+        "amazon.nova-lite-v1:0": (
+            "ap-northeast-1",
+            "ap-southeast-2",
+            "eu-west-2",
+            "us-east-1",
+            "us-gov-west-1",
+        ),
+        "amazon.nova-micro-v1:0": (
+            "ap-southeast-2",
+            "eu-west-2",
+            "us-east-1",
+            "us-gov-west-1",
+        ),
+        "amazon.nova-pro-v1:0": (
+            "ap-southeast-2",
+            "eu-west-2",
+            "us-east-1",
+            "us-gov-west-1",
+        ),
+        "anthropic.claude-3-5-haiku-20241022-v1:0": (
+            "us-west-2",
+        ),
+        "anthropic.claude-3-5-sonnet-20240620-v1:0": (
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-southeast-1",
+            "eu-central-1",
+            "eu-central-2",
+            "us-east-1",
+            "us-gov-west-1",
+            "us-west-2",
+        ),
+        "anthropic.claude-3-5-sonnet-20241022-v2:0": (
+            "ap-southeast-2",
+            "us-west-2",
+        ),
+        "anthropic.claude-3-7-sonnet-20250219-v1:0": (
+            "eu-west-2",
+            "us-gov-west-1",
+        ),
+        "anthropic.claude-3-haiku-20240307-v1:0": (
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-south-1",
+            "ap-southeast-2",
+            "eu-central-1",
+            "eu-west-1",
+            "eu-west-3",
+            "us-east-1",
+            "us-gov-west-1",
+            "us-west-2",
+        ),
+    }
     _CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
     _CHATGPT_ISSUER = "https://auth.openai.com"
     _CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -182,6 +268,33 @@ class LLMProviderManager(metaclass=Singleton):
         self._models_dev_cache_path = (
                 Path(settings.TEMP_PATH) / "llm_provider_models_dev_cache.json"
         )
+
+    def _cleanup_auth_sessions_locked(self, now: Optional[float] = None) -> None:
+        """
+        清理过期或已完成一段时间的临时授权会话。
+
+        调用方必须已经持有 `_lock`，这样 `_pending_sessions` 与
+        `_oauth_state_index` 能保持一致，避免 state 残留。
+        """
+        now = time.time() if now is None else now
+        expired_session_ids = []
+        for session_id, session in self._pending_sessions.items():
+            expires_at = session.expires_at or session.created_at + 600
+            if session.status == "pending":
+                if expires_at <= now:
+                    expired_session_ids.append(session_id)
+            elif expires_at + self._AUTH_SESSION_DONE_RETENTION <= now:
+                expired_session_ids.append(session_id)
+
+        if not expired_session_ids:
+            return
+
+        expired_session_ids_set = set(expired_session_ids)
+        for session_id in expired_session_ids:
+            self._pending_sessions.pop(session_id, None)
+        for state, session_id in list(self._oauth_state_index.items()):
+            if session_id in expired_session_ids_set:
+                self._oauth_state_index.pop(state, None)
 
     @staticmethod
     def _builtin_provider_specs() -> tuple[ProviderSpec, ...]:
@@ -338,6 +451,50 @@ class LLMProviderManager(metaclass=Singleton):
                 sort_order=30,
                 api_key_hint="填写 Anthropic API Key。",
                 description="Anthropic Claude 官方端点。",
+            ),
+            ProviderSpec(
+                id="amazon-bedrock",
+                name="Amazon Bedrock",
+                runtime="bedrock",
+                models_dev_provider_id="amazon-bedrock",
+                default_base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+                base_url_presets=(
+                    url_preset(
+                        id="bedrock-us-east-1",
+                        label="美东（弗吉尼亚北部）us-east-1",
+                        value="https://bedrock-runtime.us-east-1.amazonaws.com",
+                    ),
+                    url_preset(
+                        id="bedrock-us-west-2",
+                        label="美西（俄勒冈）us-west-2",
+                        value="https://bedrock-runtime.us-west-2.amazonaws.com",
+                    ),
+                    url_preset(
+                        id="bedrock-eu-central-1",
+                        label="欧洲（法兰克福）eu-central-1",
+                        value="https://bedrock-runtime.eu-central-1.amazonaws.com",
+                    ),
+                    url_preset(
+                        id="bedrock-ap-northeast-1",
+                        label="亚太（东京）ap-northeast-1",
+                        value="https://bedrock-runtime.ap-northeast-1.amazonaws.com",
+                    ),
+                    url_preset(
+                        id="bedrock-ap-southeast-1",
+                        label="亚太（新加坡）ap-southeast-1",
+                        value="https://bedrock-runtime.ap-southeast-1.amazonaws.com",
+                    ),
+                ),
+                base_url_editable=True,
+                api_key_label="Bedrock API Key / AK:SK",
+                api_key_hint=(
+                    "支持两种认证方式：填写 Amazon Bedrock API Key（bedrock-api-key- 开头，"
+                    "Bearer 认证）；或填写 Access Key ID:Secret Access Key（可选追加 :Session Token，"
+                    "SigV4 认证）。Base URL 决定 AWS Region。"
+                ),
+                model_list_strategy="bedrock",
+                description="Amazon Bedrock 托管模型服务，支持 Bedrock API Key 与 AK/SK 双认证。",
+                sort_order=35,
             ),
             ProviderSpec(
                 id="deepseek",
@@ -673,6 +830,88 @@ class LLMProviderManager(metaclass=Singleton):
                 sort_order=170,
             ),
             ProviderSpec(
+                id="china-unicom",
+                name="中国联通",
+                runtime="openai_compatible",
+                default_base_url="https://aigw-gzgy2.cucloud.cn:8443/v1",
+                base_url_presets=(
+                    url_preset(
+                        id="china-unicom-coding-openai",
+                        label="Coding Plan / OpenAI",
+                        value="https://aigw-gzgy2.cucloud.cn:8443/v1",
+                        model_list_strategy="manual",
+                    ),
+                    url_preset(
+                        id="china-unicom-coding-anthropic",
+                        label="Coding Plan / Anthropic",
+                        value="https://aigw-gzgy2.cucloud.cn:8443",
+                        runtime="anthropic_compatible",
+                        model_list_strategy="manual",
+                    ),
+                ),
+                base_url_editable=True,
+                api_key_hint="填写联通云 AISP / Coding Plan 专属 API Key；模型名称请按控制台可用模型 ID 手动填写。",
+                supports_model_refresh=False,
+                model_list_strategy="manual",
+                description="联通云 AISP Coding Plan 兼容端点，支持 OpenAI 与 Anthropic 协议地址预设。",
+                sort_order=172,
+            ),
+            ProviderSpec(
+                id="china-mobile",
+                name="中国移动",
+                runtime="openai_compatible",
+                default_base_url="https://ecloud.10086.cn/api",
+                base_url_presets=(
+                    url_preset(
+                        id="china-mobile-moma",
+                        label="MoMA / 移动云",
+                        value="https://ecloud.10086.cn/api",
+                    ),
+                    url_preset(
+                        id="china-mobile-coding",
+                        label="Coding Plan / 移动智算包",
+                        value="https://zhenze-huhehaote.cmecloud.cn/api/coding/v1",
+                    ),
+                ),
+                base_url_editable=True,
+                api_key_hint="填写中国移动 MoMA / 移动云 Token 服务 API Key；如控制台下发专属域名，请覆盖 Base URL。",
+                supports_model_refresh=False,
+                model_list_strategy="manual",
+                description="中国移动 MoMA / 移动云 OpenAI-compatible Token 服务，支持专属域名覆盖。",
+                sort_order=174,
+            ),
+            ProviderSpec(
+                id="china-telecom",
+                name="中国电信",
+                runtime="openai_compatible",
+                default_base_url="https://wishub-x6.ctyun.cn/v1",
+                base_url_presets=(
+                    url_preset(
+                        id="china-telecom-token-service",
+                        label="Token 服务 / 息壤",
+                        value="https://wishub-x6.ctyun.cn/v1",
+                    ),
+                    url_preset(
+                        id="china-telecom-coding-openai",
+                        label="编码套餐 / OpenAI",
+                        value="https://wishub-x6.ctyun.cn/coding/v1",
+                        model_list_strategy="manual",
+                    ),
+                    url_preset(
+                        id="china-telecom-coding-anthropic",
+                        label="编码套餐 / Anthropic",
+                        value="https://wishub-x6.ctyun.cn/coding/v1",
+                        runtime="anthropic_compatible",
+                        model_list_strategy="manual",
+                    ),
+                ),
+                base_url_editable=True,
+                api_key_label="App Key",
+                api_key_hint="填写天翼云 Token 服务 / 息壤 App Key；编码套餐模型请按控制台展示的模型 ID 手动填写。",
+                description="天翼云 Token 服务（原模型推理服务）OpenAI-compatible 端点，支持通用与编码套餐地址预设。",
+                sort_order=176,
+            ),
+            ProviderSpec(
                 id="ollama-cloud",
                 name="Ollama Cloud",
                 runtime="openai_compatible",
@@ -781,7 +1020,7 @@ class LLMProviderManager(metaclass=Singleton):
             if not self._models_dev_cache_path.exists():
                 payload = None
             else:
-                payload = json.loads(self._models_dev_cache_path.read_text(encoding="utf-8"))
+                payload = json.loads(self._models_dev_cache_path.read_text(encoding="utf-8", errors="replace"))
         except Exception as err:
             logger.warning(f"读取 models.dev provider 缓存失败: {err}")
             payload = None
@@ -975,14 +1214,20 @@ class LLMProviderManager(metaclass=Singleton):
         return builtin_specs + self._dynamic_provider_specs(builtin_specs)
 
     async def _get_provider_async(
-            self, provider_id: str, force_refresh: bool = False
+            self,
+            provider_id: str,
+            force_refresh: bool = False,
+            use_proxy: Optional[bool] = None,
     ) -> ProviderSpec:
         """异步获取指定 provider 的 ProviderSpec 实例。"""
         normalized_provider_id = self._normalize_provider_id(provider_id)
         try:
             return self.get_provider(normalized_provider_id)
         except LLMProviderError:
-            await self.get_models_dev_data(force_refresh=force_refresh)
+            await self.get_models_dev_data(
+                force_refresh=force_refresh,
+                use_proxy=use_proxy,
+            )
             return self.get_provider(normalized_provider_id)
 
     def _serialize_provider(self, spec: ProviderSpec) -> dict[str, Any]:
@@ -1022,11 +1267,16 @@ class LLMProviderManager(metaclass=Singleton):
         }
 
     async def list_providers_async(
-            self, force_refresh: bool = False
+            self,
+            force_refresh: bool = False,
+            use_proxy: Optional[bool] = None,
     ) -> list[dict[str, Any]]:
         """返回前端可渲染的 provider 目录，并优先补齐 models.dev 动态平台。"""
         try:
-            await self.get_models_dev_data(force_refresh=force_refresh)
+            await self.get_models_dev_data(
+                force_refresh=force_refresh,
+                use_proxy=use_proxy,
+            )
         except Exception as err:
             logger.debug(f"加载 models.dev provider 目录失败，回退内置列表: {err}")
         return self.list_providers()
@@ -1055,6 +1305,23 @@ class LLMProviderManager(metaclass=Singleton):
         if not value:
             return None
         return value.rstrip("/")
+
+    @staticmethod
+    def _merge_user_agent_header(
+            default_headers: Optional[dict[str, str]],
+            user_agent: Optional[str],
+    ) -> Optional[dict[str, str]]:
+        """
+        合并用户配置的 OpenAI 兼容接口 User-Agent 请求头。
+        """
+        headers = dict(default_headers or {})
+        normalized_user_agent = str(user_agent or "").strip()
+        if normalized_user_agent:
+            for key in list(headers.keys()):
+                if key.lower() == "user-agent":
+                    headers.pop(key)
+            headers["User-Agent"] = normalized_user_agent
+        return headers or None
 
     @classmethod
     def _default_base_url_for_provider(cls, spec: ProviderSpec) -> Optional[str]:
@@ -1200,10 +1467,14 @@ class LLMProviderManager(metaclass=Singleton):
         params = httpx.Client.__init__.__code__.co_varnames
         return "proxy" if "proxy" in params else "proxies"
 
-    def _build_httpx_kwargs(self) -> dict[str, Any]:
+    def _build_httpx_kwargs(self, use_proxy: Optional[bool] = None) -> dict[str, Any]:
         """构造用于 httpx 客户端的参数，如代理等。"""
-        kwargs: dict[str, Any] = {"timeout": self._DEFAULT_TIMEOUT}
-        if settings.PROXY_HOST:
+        should_use_proxy = settings.LLM_USE_PROXY if use_proxy is None else use_proxy
+        kwargs: dict[str, Any] = {
+            "timeout": self._DEFAULT_TIMEOUT,
+            "trust_env": False,
+        }
+        if should_use_proxy and settings.PROXY_HOST:
             kwargs[self._httpx_proxy_key()] = settings.PROXY_HOST
         return kwargs
 
@@ -1282,7 +1553,7 @@ class LLMProviderManager(metaclass=Singleton):
             if not self._models_dev_cache_path.exists():
                 return None
             async with aiofiles.open(
-                    self._models_dev_cache_path, mode="r", encoding="utf-8"
+                    self._models_dev_cache_path, mode="r", encoding="utf-8", errors="replace"
             ) as stream:
                 return json.loads(await stream.read())
         except Exception as err:
@@ -1295,7 +1566,7 @@ class LLMProviderManager(metaclass=Singleton):
             if not self._MODELS_DEV_BUNDLED_PATH.exists():
                 return None
             payload = json.loads(
-                self._MODELS_DEV_BUNDLED_PATH.read_text(encoding="utf-8")
+                self._MODELS_DEV_BUNDLED_PATH.read_text(encoding="utf-8", errors="replace")
             )
         except Exception as err:
             logger.warning(f"读取本地 models.dev 离线文件失败: {err}")
@@ -1314,15 +1585,19 @@ class LLMProviderManager(metaclass=Singleton):
         except Exception as err:
             logger.warning(f"写入 models.dev 缓存失败: {err}")
 
-    async def _fetch_models_dev(self) -> dict[str, Any]:
+    async def _fetch_models_dev(self, use_proxy: Optional[bool] = None) -> dict[str, Any]:
         """通过网络请求获取最新 models.dev 数据。"""
-        headers = {"User-Agent": "MoviePilot/1.0"}
-        async with httpx.AsyncClient(**self._build_httpx_kwargs()) as client:
+        headers = {"User-Agent": settings.USER_AGENT}
+        async with httpx.AsyncClient(**self._build_httpx_kwargs(use_proxy)) as client:
             response = await client.get(self._MODELS_DEV_URL, headers=headers)
             response.raise_for_status()
             return response.json()
 
-    async def get_models_dev_data(self, force_refresh: bool = False) -> dict[str, Any]:
+    async def get_models_dev_data(
+            self,
+            force_refresh: bool = False,
+            use_proxy: Optional[bool] = None,
+    ) -> dict[str, Any]:
         """
         返回 models.dev 原始数据。
 
@@ -1348,7 +1623,7 @@ class LLMProviderManager(metaclass=Singleton):
                         return cached
 
             try:
-                payload = await self._fetch_models_dev()
+                payload = await self._fetch_models_dev(use_proxy=use_proxy)
                 self._models_dev_data = payload
                 self._models_dev_loaded_at = now
                 await self._write_models_dev_to_disk(payload)
@@ -1372,9 +1647,13 @@ class LLMProviderManager(metaclass=Singleton):
             provider_id: str,
             base_url: Optional[str] = None,
             base_url_preset_id: Optional[str] = None,
+            use_proxy: Optional[bool] = None,
     ) -> dict[str, Any]:
         """获取指定 provider 在 models.dev 中的完整负载。"""
-        spec = await self._get_provider_async(provider_id)
+        spec = await self._get_provider_async(
+            provider_id,
+            use_proxy=use_proxy,
+        )
         models_dev_provider_id = self._resolve_provider_models_dev_provider_id(
             spec,
             base_url,
@@ -1382,7 +1661,23 @@ class LLMProviderManager(metaclass=Singleton):
         )
         if not models_dev_provider_id:
             return {}
-        return (await self.get_models_dev_data()).get(models_dev_provider_id, {}) or {}
+        return (
+            await self.get_models_dev_data(use_proxy=use_proxy)
+        ).get(models_dev_provider_id, {}) or {}
+
+    @staticmethod
+    def _models_dev_model_candidates(
+            provider_id: str,
+            model_id: str,
+    ) -> tuple[str, ...]:
+        """生成模型目录查询候选，兼容 Provider 添加的透明模型前缀。"""
+        candidates = [model_id]
+        if model_id.startswith("models/"):
+            candidates.append(model_id.removeprefix("models/"))
+        if provider_id == "amazon-bedrock" and "." in model_id:
+            # Cross-region Inference Profile 会增加 us./eu./global. 等前缀。
+            candidates.append(model_id.split(".", 1)[1])
+        return tuple(dict.fromkeys(candidates))
 
     async def _models_dev_model(
             self,
@@ -1390,25 +1685,135 @@ class LLMProviderManager(metaclass=Singleton):
             model_id: str,
             base_url: Optional[str] = None,
             base_url_preset_id: Optional[str] = None,
+            use_proxy: Optional[bool] = None,
     ) -> dict[str, Any] | None:
         """获取指定模型的 models.dev 元数据。"""
         payload = await self._models_dev_provider_payload(
             provider_id,
             base_url=base_url,
             base_url_preset_id=base_url_preset_id,
+            use_proxy=use_proxy,
         )
         models = payload.get("models") if isinstance(payload, dict) else None
         if not isinstance(models, dict):
             return None
 
-        candidates = [model_id]
-        if model_id.startswith("models/"):
-            candidates.append(model_id.removeprefix("models/"))
-
-        for candidate in candidates:
+        for candidate in self._models_dev_model_candidates(provider_id, model_id):
             if candidate in models:
                 return models[candidate]
         return None
+
+    @staticmethod
+    def _metadata_supports_prompt_cache(metadata: Any) -> bool:
+        """从统一模型元数据中判断是否声明了提示词缓存能力。"""
+        if not isinstance(metadata, dict):
+            return False
+
+        explicit_capability = metadata.get("prompt_cache")
+        if isinstance(explicit_capability, bool):
+            return explicit_capability
+
+        capabilities = metadata.get("capabilities")
+        if isinstance(capabilities, dict):
+            explicit_capability = capabilities.get("prompt_cache")
+            if isinstance(explicit_capability, bool):
+                return explicit_capability
+
+        cost = metadata.get("cost")
+        return isinstance(cost, dict) and any(
+            key in cost for key in ("cache_read", "cache_write")
+        )
+
+    def _cached_models_dev_model(
+            self,
+            provider_id: str,
+            model_id: str,
+            base_url: Optional[str] = None,
+            base_url_preset_id: Optional[str] = None,
+    ) -> dict[str, Any] | None:
+        """从已缓存或内置的 models.dev 数据中同步读取模型元数据。"""
+        try:
+            spec = self.get_provider(provider_id)
+        except LLMProviderError:
+            return None
+
+        models_dev_provider_id = self._resolve_provider_models_dev_provider_id(
+            spec,
+            base_url,
+            base_url_preset_id=base_url_preset_id,
+        )
+        if not models_dev_provider_id:
+            return None
+
+        payload = self._cached_models_dev_payload().get(models_dev_provider_id, {}) or {}
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(models, dict):
+            return None
+
+        for candidate in self._models_dev_model_candidates(provider_id, model_id):
+            if candidate in models:
+                return models[candidate]
+        return None
+
+    def resolve_cached_model_metadata(
+            self,
+            provider_id: str,
+            model_id: Optional[str],
+            base_url: Optional[str] = None,
+            base_url_preset_id: Optional[str] = None,
+    ) -> dict[str, Any] | None:
+        """同步解析缓存中的模型元数据，不触发远端 models.dev 刷新。"""
+        if not model_id:
+            return None
+        metadata = self._cached_models_dev_model(
+            provider_id,
+            model_id,
+            base_url=base_url,
+            base_url_preset_id=base_url_preset_id,
+        )
+        if metadata:
+            return metadata
+        if provider_id == "chatgpt":
+            return self._cached_models_dev_model("openai", model_id)
+        if provider_id == "openai":
+            return (
+                self._cached_models_dev_payload()
+                .get("openai", {})
+                .get("models", {})
+                .get(model_id)
+            )
+        return None
+
+    def _resolve_cached_model_record(
+            self,
+            provider_id: str,
+            model_id: Optional[str],
+            base_url: Optional[str] = None,
+            base_url_preset_id: Optional[str] = None,
+            transport: str = "openai",
+    ) -> dict[str, Any] | None:
+        """从缓存中的模型元数据构造轻量模型记录，不触发远端模型列表刷新。"""
+        if not model_id:
+            return None
+        metadata = self.resolve_cached_model_metadata(
+            provider_id,
+            model_id,
+            base_url=base_url,
+            base_url_preset_id=base_url_preset_id,
+        ) or {}
+        if not metadata:
+            return self._normalize_model_record(
+                model_id=model_id,
+                transport=transport,
+                source="configured",
+            )
+        return self._normalize_model_record(
+            model_id=model_id,
+            display_name=metadata.get("name") or model_id,
+            metadata=metadata,
+            transport=transport,
+            source="models.dev-cache",
+        )
 
     @staticmethod
     def _normalize_model_record(
@@ -1494,19 +1899,129 @@ class LLMProviderManager(metaclass=Singleton):
             return normalized[:-3]
         return normalized
 
-    async def _list_models_from_google(self, api_key: str) -> list[dict[str, Any]]:
+    @classmethod
+    def _extract_bedrock_region(cls, base_url: Optional[str]) -> str:
+        """
+        从 Bedrock 运行时端点 URL 中提取 AWS Region
+
+        兼容标准端点、FIPS 端点与 PrivateLink（VPCE）端点等主机名形态，
+        从中识别 Region 段。
+
+        :param base_url: 形如 https://bedrock-runtime.us-east-1.amazonaws.com 的端点地址
+        :return: 提取到的 Region，无法识别时回退 us-east-1
+        """
+        hostname = urlsplit((base_url or "").strip().lower()).hostname or ""
+        match = re.search(
+            r"(?:^|\.)(?:bedrock(?:-runtime)?(?:-fips)?)"
+            r"\.([a-z0-9-]+-\d+)(?:\.|$)",
+            hostname,
+        )
+        if match:
+            return match.group(1)
+        return cls._BEDROCK_DEFAULT_REGION
+
+    # Inference Profile 的地理前缀与可用 Region 的对应关系，用于降级目录按
+    # 当前 Region 过滤掉不可调用的 Profile 条目。
+    _BEDROCK_GEO_PREFIXES: dict[str, tuple[str, ...]] = {
+        "us": ("us-east-", "us-west-"),
+        "eu": ("eu-",),
+        "apac": ("ap-",),
+        "au": ("ap-southeast-2", "ap-southeast-4"),
+        "jp": ("ap-northeast-1", "ap-northeast-3"),
+        "ca": ("ca-",),
+    }
+    _BEDROCK_NON_COMMERCIAL_REGION_PREFIXES = (
+        "cn-",
+        "eu-isoe-",
+        "us-gov-",
+        "us-iso-",
+        "us-isob-",
+        "us-isof-",
+    )
+
+    @classmethod
+    def _bedrock_model_matches_region(cls, model_id: str, region: str) -> bool:
+        """
+        判断目录中的模型 ID 在指定 Region 是否可调用
+
+        models.dev 目录同时收录裸模型 ID（直连调用）与带地理前缀的
+        Inference Profile ID（us./eu./apac./global. 等）。带前缀的条目只在
+        对应地理分区和 AWS 分区的 Region 可用；global Profile 仅允许商业
+        AWS 分区。裸 ID 仅在明确记录的 ON_DEMAND Region 可用，未知条目
+        按不可直连处理。
+
+        :param model_id: 目录中的模型 ID
+        :param region: 当前 Base URL 对应的 AWS Region
+        :return: 该模型在当前 Region 可调用时返回 True
+        """
+        prefix = model_id.split(".", 1)[0]
+        if prefix == "global":
+            return not region.startswith(cls._BEDROCK_NON_COMMERCIAL_REGION_PREFIXES)
+        region_prefixes = cls._BEDROCK_GEO_PREFIXES.get(prefix)
+        if region_prefixes is not None:
+            return (
+                    not region.startswith(cls._BEDROCK_NON_COMMERCIAL_REGION_PREFIXES)
+                    and region.startswith(region_prefixes)
+            )
+        on_demand_regions = cls._BEDROCK_ON_DEMAND_MODEL_REGIONS.get(model_id)
+        return on_demand_regions is not None and region in on_demand_regions
+
+    @classmethod
+    def _parse_bedrock_credentials(cls, api_key: Optional[str]) -> dict[str, Any]:
+        """
+        解析 Bedrock 凭证字符串，识别 Bearer 与 SigV4 两种认证方式
+
+        - Bedrock API Key（bedrock-api-key- 开头的长期 Key，或控制台生成的短期
+          Token）走 Bearer 认证；
+        - `AccessKeyId:SecretAccessKey` 或 `AccessKeyId:SecretAccessKey:SessionToken`
+          走 SigV4 认证，AWS Access Key ID 均以 "AKIA"/"ASIA" 开头。
+
+        :param api_key: 用户在 API Key 输入框填写的凭证内容
+        :return: 含 auth_scheme 及对应凭证字段的字典
+        """
+        normalized = str(api_key or "").strip()
+        if not normalized:
+            raise LLMProviderAuthError(
+                "Amazon Bedrock 需要填写 Bedrock API Key 或 Access Key ID:Secret Access Key"
+            )
+
+        if not normalized.startswith(cls._BEDROCK_API_KEY_PREFIX):
+            parts = [part.strip() for part in normalized.split(":")]
+            if len(parts) in {2, 3} and all(parts):
+                credentials = {
+                    "auth_scheme": "sigv4",
+                    "access_key_id": parts[0],
+                    "secret_access_key": parts[1],
+                }
+                if len(parts) == 3:
+                    credentials["session_token"] = parts[2]
+                return credentials
+            if ":" in normalized:
+                raise LLMProviderAuthError(
+                    "Amazon Bedrock AK/SK 凭证格式不正确，"
+                    "请按 AccessKeyId:SecretAccessKey 或 "
+                    "AccessKeyId:SecretAccessKey:SessionToken 填写"
+                )
+
+        return {"auth_scheme": "bearer", "bearer_token": normalized}
+
+    async def _list_models_from_google(
+            self,
+            api_key: str,
+            use_proxy: Optional[bool] = None,
+    ) -> list[dict[str, Any]]:
         """从 Google AI Studio 获取模型列表。"""
         from google import genai
         from google.genai.types import HttpOptions
 
-        http_options = None
-        if settings.PROXY_HOST:
-            proxy_key = self._httpx_proxy_key()
-            proxy_args = {proxy_key: settings.PROXY_HOST}
-            http_options = HttpOptions(
-                client_args=proxy_args,
-                async_client_args=proxy_args,
-            )
+        should_use_proxy = settings.LLM_USE_PROXY if use_proxy is None else use_proxy
+        client_args: dict[str, Any] = {"trust_env": False}
+        if should_use_proxy and settings.PROXY_HOST:
+            client_args[self._httpx_proxy_key()] = settings.PROXY_HOST
+        http_options = HttpOptions(
+            client_args=client_args,
+            async_client_args=client_args,
+        )
 
         client = genai.Client(api_key=api_key, http_options=http_options)
         response = await client.aio.models.list()
@@ -1516,7 +2031,11 @@ class LLMProviderManager(metaclass=Singleton):
             if "generateContent" not in supported:
                 continue
             model_id = model.name
-            metadata = await self._models_dev_model("google", model_id) or {}
+            metadata = await self._models_dev_model(
+                "google",
+                model_id,
+                use_proxy=use_proxy,
+            ) or {}
             results.append(
                 self._normalize_model_record(
                     model_id=model_id,
@@ -1533,6 +2052,7 @@ class LLMProviderManager(metaclass=Singleton):
             api_key: str,
             base_url: str,
             default_headers: Optional[dict[str, str]] = None,
+            use_proxy: Optional[bool] = None,
     ) -> list[dict[str, Any]]:
         """通过 OpenAI 兼容接口获取模型列表。"""
         from openai import AsyncOpenAI
@@ -1543,6 +2063,7 @@ class LLMProviderManager(metaclass=Singleton):
             default_headers=default_headers,
             timeout=15.0,
             max_retries=2,
+            http_client=httpx.AsyncClient(**self._build_httpx_kwargs(use_proxy)),
         )
         results = []
         response = await client.models.list()
@@ -1551,6 +2072,7 @@ class LLMProviderManager(metaclass=Singleton):
                 provider_id,
                 model.id,
                 base_url=base_url,
+                use_proxy=use_proxy,
             ) or {}
             results.append(
                 self._normalize_model_record(
@@ -1568,6 +2090,7 @@ class LLMProviderManager(metaclass=Singleton):
             transport: str = "openai",
             base_url: Optional[str] = None,
             base_url_preset_id: Optional[str] = None,
+            use_proxy: Optional[bool] = None,
     ) -> list[dict[str, Any]]:
         """
         某些 provider 没有统一稳定的 models.list 行为，
@@ -1578,6 +2101,7 @@ class LLMProviderManager(metaclass=Singleton):
             provider_id,
             base_url=base_url,
             base_url_preset_id=base_url_preset_id,
+            use_proxy=use_proxy,
         )
         models = payload.get("models") if isinstance(payload, dict) else None
         if not isinstance(models, dict):
@@ -1595,6 +2119,235 @@ class LLMProviderManager(metaclass=Singleton):
             )
         return sorted(results, key=lambda item: item["name"].lower())
 
+    def _build_bedrock_boto3_config(
+            self,
+            use_proxy: Optional[bool] = None,
+    ) -> Any:
+        """
+        构造 Bedrock boto3 客户端配置，统一超时、重试与代理策略
+
+        :param use_proxy: 是否使用系统代理，None 时读取 LLM_USE_PROXY 配置
+        :return: botocore Config 实例
+        """
+        from botocore.config import Config
+
+        should_use_proxy = settings.LLM_USE_PROXY if use_proxy is None else use_proxy
+        proxies = None
+        if should_use_proxy and settings.PROXY_HOST:
+            proxies = {"http": settings.PROXY_HOST, "https": settings.PROXY_HOST}
+        return Config(
+            connect_timeout=10,
+            read_timeout=60,
+            retries={"max_attempts": 3, "mode": "standard"},
+            proxies=proxies,
+        )
+
+    @staticmethod
+    def _bedrock_endpoint_url(
+            service_name: str, base_url: Optional[str]
+    ) -> Optional[str]:
+        """
+        解析应传给 boto3 客户端的自定义端点 URL
+
+        标准公有端点交由 boto3 按 Region 自行推导；用户填写 PrivateLink、
+        FIPS 等非标准端点时才显式透传，保证所选网络路径实际生效。
+
+        :param service_name: boto3 服务名（bedrock 或 bedrock-runtime）
+        :param base_url: 用户配置的 Base URL
+        :return: 需要显式指定端点时返回 URL，否则返回 None
+        """
+        normalized = (base_url or "").strip().rstrip("/")
+        if not normalized:
+            return None
+        if re.fullmatch(
+                rf"https://{service_name}\.[a-z0-9-]+\.amazonaws\.com",
+                normalized,
+        ):
+            return None
+        return normalized
+
+    def create_bedrock_client(
+            self,
+            service_name: str,
+            region: str,
+            credentials: dict[str, Any],
+            base_url: Optional[str] = None,
+            use_proxy: Optional[bool] = None,
+            read_timeout: Optional[int] = None,
+    ) -> Any:
+        """
+        按解析后的凭证创建 Bedrock boto3 客户端，Bearer 方式注入 Authorization 头
+
+        :param service_name: boto3 服务名（bedrock 或 bedrock-runtime）
+        :param region: AWS Region
+        :param credentials: `_parse_bedrock_credentials` 的解析结果
+        :param base_url: 用户配置的 Base URL，非标准端点（PrivateLink/FIPS 等）时透传给 boto3
+        :param use_proxy: 是否使用系统代理
+        :param read_timeout: 读取超时秒数，None 时使用默认值
+        :return: boto3 客户端实例
+        """
+        import boto3
+        from botocore import UNSIGNED
+
+        config = self._build_bedrock_boto3_config(use_proxy)
+        if read_timeout:
+            config = config.merge(type(config)(read_timeout=read_timeout))
+        endpoint_kwargs: dict[str, Any] = {}
+        endpoint_url = self._bedrock_endpoint_url(service_name, base_url)
+        if endpoint_url:
+            endpoint_kwargs["endpoint_url"] = endpoint_url
+
+        if credentials["auth_scheme"] == "sigv4":
+            return boto3.client(
+                service_name,
+                region_name=region,
+                aws_access_key_id=credentials["access_key_id"],
+                aws_secret_access_key=credentials["secret_access_key"],
+                aws_session_token=credentials.get("session_token"),
+                config=config,
+                **endpoint_kwargs,
+            )
+
+        # Bearer 认证：以 UNSIGNED 跳过 SigV4 签名，再把 API Key 注入 Authorization 头。
+        bearer_token = credentials["bearer_token"]
+        config = config.merge(type(config)(signature_version=UNSIGNED))
+        client = boto3.client(
+            service_name,
+            region_name=region,
+            aws_access_key_id="unsigned",
+            aws_secret_access_key="unsigned",
+            config=config,
+            **endpoint_kwargs,
+        )
+
+        def _inject_bearer(request: Any, **_kwargs: Any) -> None:
+            request.headers["Authorization"] = f"Bearer {bearer_token}"
+
+        client.meta.events.register(
+            f"request-created.{service_name}",
+            _inject_bearer,
+        )
+        return client
+
+    async def _list_models_from_bedrock_fallback(
+            self,
+            region: str,
+            use_proxy: Optional[bool] = None,
+    ) -> list[dict[str, Any]]:
+        """
+        从 models.dev 目录筛选当前 Region 可调用的 Bedrock 模型
+
+        :param region: 当前 Base URL 对应的 AWS Region
+        :param use_proxy: 是否使用系统代理
+        :return: 过滤后的标准化模型记录列表
+        """
+        models = await self._list_models_from_models_dev_only(
+            provider_id="amazon-bedrock",
+            use_proxy=use_proxy,
+        )
+        return [
+            model
+            for model in models
+            if self._bedrock_model_matches_region(model["id"], region)
+        ]
+
+    async def _list_models_from_bedrock(
+            self,
+            api_key: str,
+            base_url: Optional[str],
+            use_proxy: Optional[bool] = None,
+    ) -> list[dict[str, Any]]:
+        """
+        从 Bedrock 控制面拉取模型目录，聚合跨区 Inference Profile 与直连模型
+
+        Bedrock 多数新模型仅允许通过 Inference Profile（us./eu./apac./global. 前缀）
+        调用，因此优先列出 Profile，再补充支持 ON_DEMAND 直连的基础模型。
+
+        :param api_key: 用户填写的凭证内容（Bedrock API Key 或 AK/SK）
+        :param base_url: Bedrock 运行时端点，决定 Region
+        :param use_proxy: 是否使用系统代理
+        :return: 标准化后的模型记录列表
+        """
+        credentials = self._parse_bedrock_credentials(api_key)
+        region = self._extract_bedrock_region(base_url)
+        # runtime VPCE 无法安全推导对应的控制面 VPCE；FIPS 端点也不能绕回
+        # 公有非 FIPS 控制面，因此直接使用本地目录。
+        if self._bedrock_endpoint_url("bedrock-runtime", base_url):
+            return await self._list_models_from_bedrock_fallback(region, use_proxy)
+        client = self.create_bedrock_client(
+            "bedrock",
+            region=region,
+            credentials=credentials,
+            use_proxy=use_proxy,
+        )
+
+        def _fetch() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            profiles: list[dict[str, Any]] = []
+            paginator = client.get_paginator("list_inference_profiles")
+            for page in paginator.paginate(typeEquals="SYSTEM_DEFINED"):
+                profiles.extend(page.get("inferenceProfileSummaries") or [])
+            foundation = client.list_foundation_models(
+                byOutputModality="TEXT",
+                byInferenceType="ON_DEMAND",
+            ).get("modelSummaries") or []
+            return profiles, foundation
+
+        try:
+            profile_summaries, foundation_summaries = await asyncio.to_thread(_fetch)
+        except Exception as err:
+            # 部分 Bedrock API Key 的授权范围仅覆盖 bedrock-runtime 推理接口，
+            # 控制面查询被拒时降级到 models.dev 目录，保证仍能选择模型。
+            logger.warning(
+                f"获取 Amazon Bedrock 控制面模型列表失败，降级 models.dev 目录: {err}"
+            )
+            return await self._list_models_from_bedrock_fallback(region, use_proxy)
+        finally:
+            await asyncio.to_thread(client.close)
+
+        results: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        def _append_record(model_id: str, display_name: Optional[str]) -> None:
+            if not model_id or model_id in seen_ids:
+                return
+            seen_ids.add(model_id)
+            # Inference Profile 带区域前缀，models.dev 目录按基础模型 ID 收录，
+            # 去掉首个前缀段再查一次元数据。
+            metadata = self._cached_models_dev_model("amazon-bedrock", model_id)
+            if not metadata and "." in model_id:
+                metadata = self._cached_models_dev_model(
+                    "amazon-bedrock",
+                    model_id.split(".", 1)[1],
+                )
+            results.append(
+                self._normalize_model_record(
+                    model_id=model_id,
+                    display_name=display_name or (metadata or {}).get("name") or model_id,
+                    metadata=metadata or {},
+                    source="provider",
+                )
+            )
+
+        for profile in profile_summaries:
+            if (profile.get("status") or "ACTIVE") != "ACTIVE":
+                continue
+            _append_record(
+                str(profile.get("inferenceProfileId") or "").strip(),
+                profile.get("inferenceProfileName"),
+            )
+        # 控制面已按当前 Region 和 ON_DEMAND 筛选，不能复用仅面向
+        # models.dev 降级目录的静态白名单，否则 AWS 新增模型会被遗漏。
+        for summary in foundation_summaries:
+            lifecycle = (summary.get("modelLifecycle") or {}).get("status") or "ACTIVE"
+            if lifecycle != "ACTIVE":
+                continue
+            _append_record(
+                str(summary.get("modelId") or "").strip(),
+                summary.get("modelName"),
+            )
+
+        return sorted(results, key=lambda item: item["name"].lower())
+
     @staticmethod
     def _copilot_headers(
             token: Optional[str] = None, include_auth: bool = True
@@ -1606,7 +2359,7 @@ class LLMProviderManager(metaclass=Singleton):
         仅补充 Copilot 必需的意图头，避免重复覆盖。
         """
         headers = {
-            "User-Agent": "MoviePilot/1.0",
+            "User-Agent": settings.USER_AGENT,
             "Openai-Intent": "conversation-edits",
             "x-initiator": "user",
         }
@@ -1614,9 +2367,13 @@ class LLMProviderManager(metaclass=Singleton):
             headers["Authorization"] = f"Bearer {token}"
         return headers
 
-    async def _list_models_from_copilot(self, token: str) -> list[dict[str, Any]]:
+    async def _list_models_from_copilot(
+            self,
+            token: str,
+            use_proxy: Optional[bool] = None,
+    ) -> list[dict[str, Any]]:
         """从 GitHub Copilot 端点获取模型列表。"""
-        async with httpx.AsyncClient(**self._build_httpx_kwargs()) as client:
+        async with httpx.AsyncClient(**self._build_httpx_kwargs(use_proxy)) as client:
             response = await client.get(
                 "https://api.githubcopilot.com/models",
                 headers=self._copilot_headers(token),
@@ -1653,7 +2410,11 @@ class LLMProviderManager(metaclass=Singleton):
 
             limits = ((item.get("capabilities") or {}).get("limits") or {})
             supports = ((item.get("capabilities") or {}).get("supports") or {})
-            metadata = await self._models_dev_model("github-copilot", model_id) or {}
+            metadata = await self._models_dev_model(
+                "github-copilot",
+                model_id,
+                use_proxy=use_proxy,
+            ) or {}
             results.append(
                 self._normalize_model_record(
                     model_id=model_id,
@@ -1684,6 +2445,7 @@ class LLMProviderManager(metaclass=Singleton):
             provider_id: str,
             base_url: Optional[str] = None,
             base_url_preset_id: Optional[str] = None,
+            use_proxy: Optional[bool] = None,
     ) -> list[dict[str, Any]]:
         """获取开启 OAuth 的 ChatGPT 模型列表。"""
         # ChatGPT OAuth 仍然是 chatgpt provider 专属能力，但模型目录不再维护
@@ -1692,6 +2454,7 @@ class LLMProviderManager(metaclass=Singleton):
             provider_id,
             base_url=base_url,
             base_url_preset_id=base_url_preset_id,
+            use_proxy=use_proxy,
         )
         models = payload.get("models") if isinstance(payload, dict) else None
         if not isinstance(models, dict):
@@ -1715,10 +2478,16 @@ class LLMProviderManager(metaclass=Singleton):
             api_key: Optional[str] = None,
             base_url: Optional[str] = None,
             base_url_preset_id: Optional[str] = None,
+            user_agent: Optional[str] = None,
+            use_proxy: Optional[bool] = None,
             force_refresh: bool = False,
     ) -> list[dict[str, Any]]:
         """返回标准化后的模型目录。"""
-        spec = await self._get_provider_async(provider_id, force_refresh=force_refresh)
+        spec = await self._get_provider_async(
+            provider_id,
+            force_refresh=force_refresh,
+            use_proxy=use_proxy,
+        )
         resolved_model_list_strategy = self._resolve_provider_model_list_strategy(
             spec,
             base_url,
@@ -1732,7 +2501,10 @@ class LLMProviderManager(metaclass=Singleton):
             # 对依赖 models.dev 的 provider 主动刷新一次缓存，保证“刷新模型列表”
             # 在使用目录型 provider 时也能拿到最新参数。
             if force_refresh:
-                await self.get_models_dev_data(force_refresh=True)
+                await self.get_models_dev_data(
+                    force_refresh=True,
+                    use_proxy=use_proxy,
+                )
 
         if resolved_model_list_strategy == "manual":
             # 万擎等推理点型平台没有稳定的全局模型目录，模型 ID 需要用户从控制台复制。
@@ -1744,13 +2516,21 @@ class LLMProviderManager(metaclass=Singleton):
             api_key=api_key,
             base_url=base_url,
             base_url_preset_id=base_url_preset_id,
+            user_agent=user_agent,
+            use_proxy=use_proxy,
         )
 
         if resolved_model_list_strategy == "google":
-            return await self._list_models_from_google(runtime["api_key"])
+            return await self._list_models_from_google(
+                runtime["api_key"],
+                use_proxy=use_proxy,
+            )
 
         if resolved_model_list_strategy == "github_copilot":
-            return await self._list_models_from_copilot(runtime["api_key"])
+            return await self._list_models_from_copilot(
+                runtime["api_key"],
+                use_proxy=use_proxy,
+            )
 
         if resolved_model_list_strategy == "chatgpt":
             if runtime.get("auth_mode") == "oauth":
@@ -1758,6 +2538,7 @@ class LLMProviderManager(metaclass=Singleton):
                     provider_id=provider_id,
                     base_url=base_url,
                     base_url_preset_id=base_url_preset_id,
+                    use_proxy=use_proxy,
                 )
             return await self._list_models_from_openai_compatible(
                 provider_id="chatgpt",
@@ -1767,7 +2548,18 @@ class LLMProviderManager(metaclass=Singleton):
                     runtime["base_url"],
                     base_url_preset_id=base_url_preset_id,
                 ),
-                default_headers=runtime.get("default_headers"),
+                default_headers=self._merge_user_agent_header(
+                    runtime.get("default_headers"),
+                    user_agent,
+                ),
+                use_proxy=use_proxy,
+            )
+
+        if resolved_model_list_strategy == "bedrock":
+            return await self._list_models_from_bedrock(
+                api_key=runtime["api_key"],
+                base_url=runtime.get("base_url"),
+                use_proxy=use_proxy,
             )
 
         if resolved_model_list_strategy == "anthropic_compatible":
@@ -1776,6 +2568,7 @@ class LLMProviderManager(metaclass=Singleton):
                 transport="anthropic",
                 base_url=base_url,
                 base_url_preset_id=base_url_preset_id,
+                use_proxy=use_proxy,
             )
             
         if resolved_model_list_strategy == "models_dev_only":
@@ -1784,6 +2577,7 @@ class LLMProviderManager(metaclass=Singleton):
                 transport="openai",
                 base_url=base_url,
                 base_url_preset_id=base_url_preset_id,
+                use_proxy=use_proxy,
             )
 
         # openai-compatible / deepseek 默认走官方 models 端点。
@@ -1795,7 +2589,11 @@ class LLMProviderManager(metaclass=Singleton):
                 runtime["base_url"],
                 base_url_preset_id=base_url_preset_id,
             ),
-            default_headers=runtime.get("default_headers"),
+            default_headers=self._merge_user_agent_header(
+                runtime.get("default_headers"),
+                user_agent,
+            ),
+            use_proxy=use_proxy,
         )
 
     async def resolve_model_metadata(
@@ -1804,6 +2602,7 @@ class LLMProviderManager(metaclass=Singleton):
             model_id: Optional[str],
             base_url: Optional[str] = None,
             base_url_preset_id: Optional[str] = None,
+            use_proxy: Optional[bool] = None,
     ) -> dict[str, Any] | None:
         """解析并返回指定模型在 models.dev 中的元数据。"""
         if not model_id:
@@ -1813,13 +2612,18 @@ class LLMProviderManager(metaclass=Singleton):
             model_id,
             base_url=base_url,
             base_url_preset_id=base_url_preset_id,
+            use_proxy=use_proxy,
         )
         if metadata:
             return metadata
         if provider_id == "chatgpt":
-            return await self._models_dev_model("openai", model_id)
+            return await self._models_dev_model(
+                "openai",
+                model_id,
+                use_proxy=use_proxy,
+            )
         if provider_id == "openai":
-            models_dev = await self.get_models_dev_data()
+            models_dev = await self.get_models_dev_data(use_proxy=use_proxy)
             return models_dev.get("openai", {}).get("models", {}).get(model_id)
         return None
 
@@ -1829,7 +2633,7 @@ class LLMProviderManager(metaclass=Singleton):
         try:
             return jwt.decode(token, options={"verify_signature": False})
         except Exception as err:
-            print(err)
+            logger.debug(f"解析 JWT token 内容失败: {err}")
             return {}
 
     @staticmethod
@@ -1919,6 +2723,7 @@ class LLMProviderManager(metaclass=Singleton):
                 }
             )
             with self._lock:
+                self._cleanup_auth_sessions_locked()
                 self._pending_sessions[session.session_id] = session
                 self._oauth_state_index[state] = session.session_id
             return {
@@ -1935,7 +2740,7 @@ class LLMProviderManager(metaclass=Singleton):
                     f"{self._CHATGPT_ISSUER}/api/accounts/deviceauth/usercode",
                     headers={
                         "Content-Type": "application/json",
-                        "User-Agent": "MoviePilot/1.0",
+                        "User-Agent": settings.USER_AGENT,
                     },
                     json={"client_id": self._CHATGPT_CLIENT_ID},
                 )
@@ -1953,6 +2758,7 @@ class LLMProviderManager(metaclass=Singleton):
                 }
             )
             with self._lock:
+                self._cleanup_auth_sessions_locked()
                 self._pending_sessions[session.session_id] = session
             return {
                 "session_id": session.session_id,
@@ -1971,7 +2777,7 @@ class LLMProviderManager(metaclass=Singleton):
                     headers={
                         "Accept": "application/json",
                         "Content-Type": "application/json",
-                        "User-Agent": "MoviePilot/1.0",
+                        "User-Agent": settings.USER_AGENT,
                     },
                     json={
                         "client_id": self._COPILOT_CLIENT_ID,
@@ -1991,6 +2797,7 @@ class LLMProviderManager(metaclass=Singleton):
                 }
             )
             with self._lock:
+                self._cleanup_auth_sessions_locked()
                 self._pending_sessions[session.session_id] = session
             return {
                 "session_id": session.session_id,
@@ -2007,6 +2814,7 @@ class LLMProviderManager(metaclass=Singleton):
     def get_session_status(self, session_id: str) -> dict[str, Any]:
         """读取临时授权会话状态。"""
         with self._lock:
+            self._cleanup_auth_sessions_locked()
             session = self._pending_sessions.get(session_id)
             if not session:
                 raise LLMProviderAuthError("授权会话不存在或已过期")
@@ -2053,6 +2861,7 @@ class LLMProviderManager(metaclass=Singleton):
         if error:
             message = error_description or error
             with self._lock:
+                self._cleanup_auth_sessions_locked()
                 session_id = self._oauth_state_index.pop(state or "", None)
                 if session_id and session_id in self._pending_sessions:
                     self._mark_session_error(self._pending_sessions[session_id], message)
@@ -2062,6 +2871,7 @@ class LLMProviderManager(metaclass=Singleton):
             return False, "缺少授权码或 state 参数"
 
         with self._lock:
+            self._cleanup_auth_sessions_locked()
             session_id = self._oauth_state_index.pop(state, None)
             session = self._pending_sessions.get(session_id or "")
 
@@ -2104,6 +2914,7 @@ class LLMProviderManager(metaclass=Singleton):
         前端可按 interval_seconds 轮询，直到状态变为 authorized / failed。
         """
         with self._lock:
+            self._cleanup_auth_sessions_locked()
             session = self._pending_sessions.get(session_id)
         if not session:
             raise LLMProviderAuthError("授权会话不存在或已过期")
@@ -2162,7 +2973,7 @@ class LLMProviderManager(metaclass=Singleton):
                 f"{self._CHATGPT_ISSUER}/api/accounts/deviceauth/token",
                 headers={
                     "Content-Type": "application/json",
-                    "User-Agent": "MoviePilot/1.0",
+                    "User-Agent": settings.USER_AGENT,
                 },
                 json={
                     "device_auth_id": session.context["device_auth_id"],
@@ -2207,7 +3018,7 @@ class LLMProviderManager(metaclass=Singleton):
                 headers={
                     "Accept": "application/json",
                     "Content-Type": "application/json",
-                    "User-Agent": "MoviePilot/1.0",
+                    "User-Agent": settings.USER_AGENT,
                 },
                 json={
                     "client_id": self._COPILOT_CLIENT_ID,
@@ -2281,6 +3092,8 @@ class LLMProviderManager(metaclass=Singleton):
             api_key: Optional[str] = None,
             base_url: Optional[str] = None,
             base_url_preset_id: Optional[str] = None,
+            user_agent: Optional[str] = None,
+            use_proxy: Optional[bool] = None,
     ) -> dict[str, Any]:
         """
         解析 provider 运行时参数。
@@ -2292,7 +3105,10 @@ class LLMProviderManager(metaclass=Singleton):
             normalized_provider_id,
             base_url_preset_id,
         )
-        spec = await self._get_provider_async(normalized_provider_id)
+        spec = await self._get_provider_async(
+            normalized_provider_id,
+            use_proxy=use_proxy,
+        )
         resolved_runtime = self._resolve_provider_runtime(
             spec,
             base_url,
@@ -2300,36 +3116,31 @@ class LLMProviderManager(metaclass=Singleton):
         )
         normalized_api_key = str(api_key or "").strip() or None
         normalized_base_url = self._sanitize_base_url(base_url)
-        model_record = None
-        if model:
-            try:
-                model_record = next(
-                    (
-                        item
-                        for item in await self.list_models(
-                        normalized_provider_id,
-                        api_key=api_key,
-                        base_url=base_url,
-                        base_url_preset_id=normalized_base_url_preset_id,
-                    )
-                        if item["id"] == model
-                    ),
-                    None,
-                )
-            except Exception as err:
-                print(err)
-                model_record = None
+        default_transport = (
+            "anthropic" if resolved_runtime == "anthropic_compatible" else "openai"
+        )
+        model_record = self._resolve_cached_model_record(
+            normalized_provider_id,
+            model,
+            base_url=base_url,
+            base_url_preset_id=normalized_base_url_preset_id,
+            transport=default_transport,
+        )
+        model_metadata = self.resolve_cached_model_metadata(
+            normalized_provider_id,
+            model,
+            base_url=base_url,
+            base_url_preset_id=normalized_base_url_preset_id,
+        )
 
         result: dict[str, Any] = {
             "provider_id": normalized_provider_id,
             "runtime": resolved_runtime,
             "model_id": model,
             "model_record": model_record,
-            "model_metadata": await self.resolve_model_metadata(
-                normalized_provider_id,
-                model,
-                base_url=base_url,
-                base_url_preset_id=normalized_base_url_preset_id,
+            "model_metadata": model_metadata,
+            "supports_prompt_cache": self._metadata_supports_prompt_cache(
+                model_metadata
             ),
             "default_headers": None,
             "use_responses_api": None,
@@ -2341,8 +3152,7 @@ class LLMProviderManager(metaclass=Singleton):
             try:
                 auth = await self._resolve_chatgpt_oauth()
             except Exception as err:
-                print(err)
-                pass
+                logger.debug(f"解析 ChatGPT OAuth 鉴权失败，回退 API Key 模式: {err}")
 
             if auth:
                 headers = {"originator": "moviepilot"}
@@ -2353,7 +3163,10 @@ class LLMProviderManager(metaclass=Singleton):
                         "runtime": "chatgpt",
                         "api_key": auth["access_token"],
                         "base_url": self._CHATGPT_CODEX_BASE_URL,
-                        "default_headers": headers,
+                        "default_headers": self._merge_user_agent_header(
+                            headers,
+                            user_agent,
+                        ),
                         "use_responses_api": True,
                         "auth_mode": "oauth",
                     }
@@ -2367,6 +3180,10 @@ class LLMProviderManager(metaclass=Singleton):
                         "api_key": normalized_api_key,
                         "base_url": normalized_base_url
                                     or self._default_base_url_for_provider(spec),
+                        "default_headers": self._merge_user_agent_header(
+                            None,
+                            user_agent,
+                        ),
                         "auth_mode": "api_key",
                     }
                 )
@@ -2391,9 +3208,12 @@ class LLMProviderManager(metaclass=Singleton):
                     else "github_copilot",
                     "api_key": token,
                     "base_url": "https://api.githubcopilot.com",
-                    "default_headers": self._copilot_headers(
-                        token,
-                        include_auth=transport == "anthropic",
+                    "default_headers": self._merge_user_agent_header(
+                        self._copilot_headers(
+                            token,
+                            include_auth=transport == "anthropic",
+                        ),
+                        user_agent,
                     ),
                     "auth_mode": "oauth" if auth else "api_key",
                 }
@@ -2407,6 +3227,22 @@ class LLMProviderManager(metaclass=Singleton):
                 {
                     "api_key": normalized_api_key,
                     "base_url": None,
+                    "auth_mode": "api_key",
+                }
+            )
+            return result
+
+        if resolved_runtime == "bedrock":
+            effective_base_url = normalized_base_url or self._default_base_url_for_provider(
+                spec
+            )
+            credentials = self._parse_bedrock_credentials(normalized_api_key)
+            result.update(
+                {
+                    "api_key": normalized_api_key,
+                    "base_url": effective_base_url,
+                    "aws_region": self._extract_bedrock_region(effective_base_url),
+                    "aws_auth": credentials,
                     "auth_mode": "api_key",
                 }
             )
@@ -2426,6 +3262,10 @@ class LLMProviderManager(metaclass=Singleton):
                     "base_url": self._normalize_base_url_for_anthropic(
                         effective_base_url
                     ),
+                    "default_headers": self._merge_user_agent_header(
+                        None,
+                        user_agent,
+                    ),
                     "auth_mode": "api_key",
                 }
             )
@@ -2440,6 +3280,7 @@ class LLMProviderManager(metaclass=Singleton):
             {
                 "api_key": normalized_api_key,
                 "base_url": effective_base_url,
+                "default_headers": self._merge_user_agent_header(None, user_agent),
                 "auth_mode": "api_key",
             }
         )
